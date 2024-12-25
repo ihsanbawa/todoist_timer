@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+ENV/
+env/
+.venv/
+.pyenv/
+*.egg-info/
+
+# Secret environment variables
+.env
+
+# Flask debug logs
+*.log
+
+# macOS system files
+.DS_Store
+
+# IDE-specific files (e.g., VS Code, PyCharm)
+.vscode/
+.idea/
+
+# Ngrok files
+ngrok.log
+
+# pytest cache
+.pytest_cache/
+
+# General temporary files
+*.swp
+*.swo
+*.tmp
