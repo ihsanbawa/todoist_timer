@@ -4,6 +4,9 @@ from pyngrok import ngrok
 from dotenv import load_dotenv
 import os
 import logging
+import hmac
+import hashlib
+import base64
 
 # Load environment variables from .env
 load_dotenv()
@@ -15,12 +18,36 @@ app = Flask(__name__)
 # In-memory store for timers
 timers = {}
 
+def validate_hmac(payload, received_hmac):
+    """Validate the HMAC signature in the request."""
+    client_secret = os.getenv("TODOIST_CLIENT_SECRET")
+    if not client_secret:
+        app.logger.error("TODOIST_CLIENT_SECRET not found in environment variables.")
+        return False
+
+    try:
+        # Generate expected HMAC
+        expected_hmac = hmac.new(client_secret.encode(), payload, hashlib.sha256).digest()
+        expected_hmac_b64 = base64.b64encode(expected_hmac).decode()
+
+        # Compare HMACs
+        return hmac.compare_digest(received_hmac, expected_hmac_b64)
+    except Exception as e:
+        app.logger.error(f"Error validating HMAC: {e}")
+        return False
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
         # Log request headers and raw request data for debugging
         app.logger.info(f"Request Headers: {request.headers}")
         app.logger.info(f"Raw Request Data: {request.data}")
+
+        # Validate HMAC
+        received_hmac = request.headers.get("X-Todoist-Hmac-SHA256", "")
+        if not validate_hmac(request.data, received_hmac):
+            app.logger.error("Invalid HMAC signature.")
+            return jsonify({"error": "Unauthorized"}), 401
 
         # Parse JSON payload
         data = request.json
@@ -36,17 +63,22 @@ def webhook():
             app.logger.info(f"Unhandled event type: {event_name}")
             return jsonify({"message": "Event not handled"}), 200
 
-        # Extract relevant fields
-        task_id = data.get("event_data", {}).get("item_id")
-        user_id = data.get("event_data", {}).get("user_id")
-        comment_text = data.get("event_data", {}).get("content", "").lower()
+        # Extract relevant fields from `event_data`
+        event_data = data.get("event_data", {})
+        task_id = event_data.get("item", {}).get("id")  # Extract task_id from `item`
+        user_id = event_data.get("item", {}).get("user_id")  # Extract user_id from `item`
+        comment_text = event_data.get("content", "").lower()
 
         if not task_id or not user_id:
             app.logger.error("Invalid payload: Missing task_id or user_id")
             return jsonify({"error": "Invalid payload"}), 400
 
+        # Log current timers for debugging
+        app.logger.info(f"Current timers: {timers}")
+
         # Timer logic
         timer_key = f"{user_id}:{task_id}"
+        app.logger.info(f"Processing command for key: {timer_key}")
 
         if "start timer" in comment_text:
             if timer_key in timers:
@@ -79,7 +111,6 @@ def webhook():
     except Exception as e:
         app.logger.error(f"Error in webhook processing: {e}")
         return jsonify({"error": "Internal server error"}), 500
-
 
 if __name__ == '__main__':
     # Retrieve ngrok auth token from environment variables
