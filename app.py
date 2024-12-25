@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 import datetime
-from pyngrok import ngrok
 from dotenv import load_dotenv
 import os
 import logging
@@ -56,7 +55,7 @@ def post_todoist_comment(task_id, content):
             "content": content
         }
         response = requests.post(url, json=payload, headers=headers)
-        if response.status_code == 200 or response.status_code == 201:
+        if response.status_code in (200, 201):
             app.logger.info(f"Successfully posted comment to task {task_id}: {content}")
         else:
             app.logger.error(f"Failed to post comment to task {task_id}. Status code: {response.status_code}, Response: {response.text}")
@@ -159,18 +158,5 @@ def webhook():
         return jsonify({"error": "Internal server error."}), 500
 
 if __name__ == '__main__':
-    # Retrieve ngrok auth token from environment variables
-    ngrok_auth_token = os.getenv("NGROK_AUTH_TOKEN")
-    if not ngrok_auth_token:
-        raise RuntimeError("NGROK_AUTH_TOKEN not found in environment variables.")
-
-    # Set the ngrok auth token
-    ngrok.set_auth_token(ngrok_auth_token)
-
-    # Start ngrok and expose Flask app
-    public_url = ngrok.connect("5001").public_url
-    print(f" * ngrok tunnel: {public_url}")
-    app.logger.info(f"ngrok tunnel running at: {public_url}")
-
     # Run the Flask app
-    app.run(port=5001)
+    app.run(port=5001, host='0.0.0.0')
