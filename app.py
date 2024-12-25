@@ -45,33 +45,48 @@ def webhook():
 
         # Validate HMAC
         received_hmac = request.headers.get("X-Todoist-Hmac-SHA256", "")
+        if not received_hmac:
+            app.logger.error("Missing HMAC signature in headers.")
+            return jsonify({"error": "Missing HMAC signature."}), 401
+
         if not validate_hmac(request.data, received_hmac):
             app.logger.error("Invalid HMAC signature.")
             return jsonify({"error": "Unauthorized"}), 401
 
         # Parse JSON payload
-        data = request.json
+        try:
+            data = request.get_json()
+            if not data:
+                raise ValueError("Empty or invalid JSON payload.")
+        except Exception as e:
+            app.logger.error(f"Error parsing JSON payload: {e}")
+            return jsonify({"error": "Malformed JSON payload."}), 400
+
         app.logger.info(f"Parsed JSON Payload: {data}")
 
         # Validate and process payload
-        if not data:
-            app.logger.error("No data received in request.")
-            return jsonify({"error": "No data received"}), 400
-
         event_name = data.get("event_name")
+        if not event_name:
+            app.logger.error("Missing event_name in payload.")
+            return jsonify({"error": "Missing event_name in payload."}), 400
+
         if event_name != "note:added":
             app.logger.info(f"Unhandled event type: {event_name}")
             return jsonify({"message": "Event not handled"}), 200
 
         # Extract relevant fields from `event_data`
         event_data = data.get("event_data", {})
+        if not event_data:
+            app.logger.error("Missing event_data in payload.")
+            return jsonify({"error": "Missing event_data in payload."}), 400
+
         task_id = event_data.get("item", {}).get("id")  # Extract task_id from `item`
         user_id = event_data.get("item", {}).get("user_id")  # Extract user_id from `item`
         comment_text = event_data.get("content", "").lower()
 
         if not task_id or not user_id:
-            app.logger.error("Invalid payload: Missing task_id or user_id")
-            return jsonify({"error": "Invalid payload"}), 400
+            app.logger.error("Invalid payload: Missing task_id or user_id.")
+            return jsonify({"error": "Invalid payload: Missing task_id or user_id."}), 400
 
         # Log current timers for debugging
         app.logger.info(f"Current timers: {timers}")
@@ -110,7 +125,7 @@ def webhook():
 
     except Exception as e:
         app.logger.error(f"Error in webhook processing: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({"error": "Internal server error."}), 500
 
 if __name__ == '__main__':
     # Retrieve ngrok auth token from environment variables
