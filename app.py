@@ -7,6 +7,7 @@ import logging
 import hmac
 import hashlib
 import base64
+import requests
 
 # Load environment variables from .env
 load_dotenv()
@@ -17,6 +18,12 @@ app = Flask(__name__)
 
 # In-memory store for timers
 timers = {}
+
+TODOIST_API_BASE_URL = "https://api.todoist.com/rest/v2"
+TODOIST_API_TOKEN = os.getenv("TODOIST_API_TOKEN")
+
+if not TODOIST_API_TOKEN:
+    raise RuntimeError("TODOIST_API_TOKEN not found in environment variables.")
 
 def validate_hmac(payload, received_hmac):
     """Validate the HMAC signature in the request."""
@@ -35,6 +42,26 @@ def validate_hmac(payload, received_hmac):
     except Exception as e:
         app.logger.error(f"Error validating HMAC: {e}")
         return False
+
+def post_todoist_comment(task_id, content):
+    """Post a comment to a Todoist task."""
+    try:
+        url = f"{TODOIST_API_BASE_URL}/comments"
+        headers = {
+            "Authorization": f"Bearer {TODOIST_API_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "task_id": task_id,
+            "content": content
+        }
+        response = requests.post(url, json=payload, headers=headers)
+        if response.status_code == 200 or response.status_code == 201:
+            app.logger.info(f"Successfully posted comment to task {task_id}: {content}")
+        else:
+            app.logger.error(f"Failed to post comment to task {task_id}. Status code: {response.status_code}, Response: {response.text}")
+    except Exception as e:
+        app.logger.error(f"Error posting comment to Todoist: {e}")
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -106,6 +133,7 @@ def webhook():
         elif "stop timer" in comment_text:
             if timer_key not in timers:
                 app.logger.info(f"No timer running for key: {timer_key}")
+                post_todoist_comment(task_id, "No timer found to stop.")
                 return jsonify({"message": "No timer running for this task."}), 200
 
             start_time = timers[timer_key]["start_time"]
@@ -115,7 +143,10 @@ def webhook():
             elapsed_seconds = elapsed_time.total_seconds()
             hours, remainder = divmod(elapsed_seconds, 3600)
             minutes, seconds = divmod(remainder, 60)
-            elapsed_str = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+            elapsed_str = f"Elapsed time: {int(hours)}h {int(minutes)}m {int(seconds)}s"
+
+            # Post the elapsed time as a comment to the task
+            post_todoist_comment(task_id, elapsed_str)
 
             app.logger.info(f"Timer stopped for key: {timer_key}. Elapsed time: {elapsed_str}")
             return jsonify({"message": f"Timer stopped. Total time: {elapsed_str}"}), 200
