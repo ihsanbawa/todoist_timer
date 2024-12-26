@@ -12,7 +12,13 @@ import requests
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler()  # Logs will be viewable in Railway
+    ]
+)
 app = Flask(__name__)
 
 # In-memory store for timers
@@ -65,7 +71,8 @@ def post_todoist_comment(task_id, content):
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        # Log request headers and raw request data for debugging
+        # Log receipt of webhook
+        app.logger.info("Received webhook request.")
         app.logger.info(f"Request Headers: {request.headers}")
         app.logger.info(f"Raw Request Data: {request.data}")
 
