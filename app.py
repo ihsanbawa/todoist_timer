@@ -20,7 +20,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.StreamHandler()  # Logs will be viewable in Railway
+        logging.StreamHandler()  # Logs will be viewable in your environment (e.g. Railway)
     ]
 )
 app = Flask(__name__)
@@ -75,6 +75,56 @@ def post_todoist_comment(task_id, content):
     except Exception as e:
         app.logger.error(f"Error posting comment to Todoist: {e}")
 
+def update_todoist_description(task_id, new_description):
+    """
+    Helper function to update a Todoist task's description
+    using the official POST /rest/v2/tasks/{task_id} endpoint.
+    """
+    try:
+        update_url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
+        headers = {
+            "Authorization": f"Bearer {TODOIST_API_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {"description": new_description}
+        response = requests.post(update_url, headers=headers, json=payload)
+
+        if response.status_code != 200:
+            app.logger.error(
+                f"Failed to update task {task_id} description. "
+                f"Status: {response.status_code}, Response: {response.text}"
+            )
+            return False
+
+        app.logger.info(f"Successfully updated task {task_id} description to: {new_description}")
+        return True
+    except Exception as e:
+        app.logger.error(f"Error updating Todoist description: {e}")
+        return False
+
+def get_current_description(task_id):
+    """Fetch the current description of a Todoist task."""
+    try:
+        get_url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
+        headers = {
+            "Authorization": f"Bearer {TODOIST_API_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        resp = requests.get(get_url, headers=headers)
+
+        if resp.status_code != 200:
+            app.logger.error(
+                f"Failed to fetch task {task_id}. "
+                f"Status: {resp.status_code}, Response: {resp.text}"
+            )
+            return None
+
+        task_data = resp.json()
+        return task_data.get("description", "")
+    except Exception as e:
+        app.logger.error(f"Error fetching Todoist task description: {e}")
+        return None
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
@@ -94,22 +144,19 @@ def webhook():
             return jsonify({"error": "Unauthorized"}), 401
 
         # Parse JSON payload
-        try:
-            data = request.get_json()
-            if not data:
-                raise ValueError("Empty or invalid JSON payload.")
-        except Exception as e:
-            app.logger.error(f"Error parsing JSON payload: {e}")
+        data = request.get_json()
+        if not data:
+            app.logger.error("Empty or invalid JSON payload.")
             return jsonify({"error": "Malformed JSON payload."}), 400
 
         app.logger.info(f"Parsed JSON Payload: {data}")
 
-        # Validate and process payload
         event_name = data.get("event_name")
         if not event_name:
             app.logger.error("Missing event_name in payload.")
             return jsonify({"error": "Missing event_name in payload."}), 400
 
+        # We only handle note:added
         if event_name != "note:added":
             app.logger.info(f"Unhandled event type: {event_name}")
             return jsonify({"message": "Event not handled"}), 200
@@ -136,14 +183,17 @@ def webhook():
         app.logger.info(f"Processing command for key: {timer_key}")
 
         if "start timer" in comment_text:
+            # START TIMER
             if timer_key in timers:
                 app.logger.info(f"Timer already running for key: {timer_key}")
                 return jsonify({"message": "Timer already running."}), 200
+
             timers[timer_key] = {"start_time": datetime.datetime.now()}
             app.logger.info(f"Timer started for key: {timer_key}")
             return jsonify({"message": "Timer started."}), 200
 
         elif "stop timer" in comment_text:
+            # STOP TIMER
             if timer_key not in timers:
                 app.logger.info(f"No timer running for key: {timer_key}")
                 post_todoist_comment(task_id, "No timer found to stop.")
@@ -153,13 +203,31 @@ def webhook():
             elapsed_time = datetime.datetime.now() - start_time
             del timers[timer_key]
 
+            # Calculate final elapsed time
             elapsed_seconds = elapsed_time.total_seconds()
             hours, remainder = divmod(elapsed_seconds, 3600)
             minutes, seconds = divmod(remainder, 60)
-            elapsed_str = f"Elapsed time: {int(hours)}h {int(minutes)}m {int(seconds)}s"
+            elapsed_str = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
 
-            # Post the elapsed time as a comment to the task
-            post_todoist_comment(task_id, elapsed_str)
+            # OPTIONAL: Post the elapsed time as a comment (can remove if undesired)
+            post_todoist_comment(task_id, f"Elapsed time: {elapsed_str}")
+
+            # Now, also update the Todoist description to show final total time
+            current_desc = get_current_description(task_id)
+            if current_desc is not None:
+                # Remove any "(Timer Running: XX minutes)" snippet
+                pattern = r"\(Timer Running: \d+ minutes\)"
+                updated_desc = re.sub(pattern, "", current_desc).strip()
+
+                # Append the final "Total Time" snippet
+                # e.g. "(Total Time: 1h 23m 45s)"
+                total_time_snippet = f"(Total Time: {elapsed_str})"
+                if updated_desc:
+                    updated_desc = f"{updated_desc} {total_time_snippet}".strip()
+                else:
+                    updated_desc = total_time_snippet
+
+                update_todoist_description(task_id, updated_desc)
 
             app.logger.info(f"Timer stopped for key: {timer_key}. Elapsed time: {elapsed_str}")
             return jsonify({"message": f"Timer stopped. Total time: {elapsed_str}"}), 200
@@ -191,22 +259,10 @@ def update_descriptions():
         elapsed = now - start_time
         elapsed_minutes = int(elapsed.total_seconds() // 60)
 
-        # 1) Fetch the task's current description
-        get_url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
-        headers = {
-            "Authorization": f"Bearer {TODOIST_API_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        get_resp = requests.get(get_url, headers=headers)
-        if get_resp.status_code != 200:
-            app.logger.error(
-                f"Failed to fetch task {task_id}. "
-                f"Status: {get_resp.status_code}, Resp: {get_resp.text}"
-            )
-            continue
-
-        task_data = get_resp.json()
-        current_description = task_data.get("description", "")
+        # 1) Fetch the current task description
+        current_description = get_current_description(task_id)
+        if current_description is None:
+            continue  # We already logged the error
 
         # 2) Remove any old "(Timer Running: X minutes)" snippet
         pattern = r"\(Timer Running: \d+ minutes\)"
@@ -214,40 +270,27 @@ def update_descriptions():
 
         # 3) Append the new snippet
         timer_snippet = f"(Timer Running: {elapsed_minutes} minutes)"
-        updated_description = (
-            f"{updated_description} {timer_snippet}".strip()
-            if updated_description
-            else timer_snippet
-        )
-
-        # 4) Update the task using POST /rest/v2/tasks/{task_id} (per Todoist docs)
-        update_url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
-        payload = {"description": updated_description}
-        update_resp = requests.post(update_url, headers=headers, json=payload)
-
-        # On success, Todoist returns HTTP 200
-        if update_resp.status_code != 200:
-            app.logger.error(
-                f"Failed to update task {task_id} with new description. "
-                f"Status: {update_resp.status_code}, Response: {update_resp.text}"
-            )
+        if updated_description:
+            updated_description = f"{updated_description} {timer_snippet}".strip()
         else:
-            app.logger.info(
-                f"Successfully updated task {task_id} description to: {updated_description}"
-            )
+            updated_description = timer_snippet
+
+        # 4) Update the task description
+        update_todoist_description(task_id, updated_description)
 
 def start_scheduler():
-    """Start the APScheduler background job to update descriptions every 5 minutes."""
+    """Start the APScheduler background job to update descriptions every X minutes."""
     scheduler = BackgroundScheduler(daemon=True)
     scheduler.add_job(
         func=update_descriptions,
         trigger="interval",
-        minutes=1
+        minutes=5  # Change to 1, 2, etc., if you prefer
     )
     scheduler.start()
 
 if __name__ == '__main__':
     # Start the scheduler
     start_scheduler()
+
     # Run the Flask app
     app.run(port=5001, host='0.0.0.0')
