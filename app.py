@@ -256,9 +256,9 @@ def webhook():
                     # No existing "Total Time" snippet; use new elapsed time as-is
                     new_elapsed_str = elapsed_str
 
-                # Remove any existing "Timer Running" snippet and update description
-                timer_running_pattern = r"\(Timer Running: \d+ minutes\)"
-                updated_desc = re.sub(timer_running_pattern, "", current_desc).strip()
+                # Remove any existing "Total Time" snippet and "Timer Running" snippet
+                total_time_and_running_pattern = r"\(Total Time: .*?\)|\(Timer Running: .*?\)"
+                updated_desc = re.sub(total_time_and_running_pattern, "", current_desc).strip()
 
                 # Append the new total time
                 total_time_snippet = f"(Total Time: {new_elapsed_str})"
@@ -278,7 +278,6 @@ def webhook():
     except Exception as e:
         app.logger.error(f"Error in webhook processing: {e}")
         return jsonify({"error": "Internal server error."}), 500
-
 
 def update_descriptions():
     """Update running tasks' Todoist descriptions to show elapsed time."""
