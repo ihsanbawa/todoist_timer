@@ -229,16 +229,39 @@ def webhook():
             # OPTIONAL: Post the elapsed time as a comment (can remove if undesired)
             post_todoist_comment(task_id, f"Elapsed time: {elapsed_str}")
 
-            # Now, also update the Todoist description to show final total time
+            # Fetch current description
             current_desc = get_current_description(task_id)
             if current_desc is not None:
-                # Remove any "(Timer Running: XX minutes)" snippet
-                pattern = r"\(Timer Running: \d+ minutes\)"
-                updated_desc = re.sub(pattern, "", current_desc).strip()
+                # Check if there is already a "Total Time" snippet
+                total_time_pattern = r"\(Total Time: (\d+)h (\d+)m (\d+)s\)"
+                match = re.search(total_time_pattern, current_desc)
 
-                # Append the final "Total Time" snippet
-                # e.g. "(Total Time: 1h 23m 45s)"
-                total_time_snippet = f"(Total Time: {elapsed_str})"
+                if match:
+                    # Extract existing hours, minutes, seconds
+                    existing_hours = int(match.group(1))
+                    existing_minutes = int(match.group(2))
+                    existing_seconds = int(match.group(3))
+
+                    # Add new elapsed time to the existing time
+                    total_seconds = (
+                        existing_hours * 3600 +
+                        existing_minutes * 60 +
+                        existing_seconds +
+                        elapsed_seconds
+                    )
+                    new_hours, remainder = divmod(total_seconds, 3600)
+                    new_minutes, new_seconds = divmod(remainder, 60)
+                    new_elapsed_str = f"{int(new_hours)}h {int(new_minutes)}m {int(new_seconds)}s"
+                else:
+                    # No existing "Total Time" snippet; use new elapsed time as-is
+                    new_elapsed_str = elapsed_str
+
+                # Remove any existing "Timer Running" snippet and update description
+                timer_running_pattern = r"\(Timer Running: \d+ minutes\)"
+                updated_desc = re.sub(timer_running_pattern, "", current_desc).strip()
+
+                # Append the new total time
+                total_time_snippet = f"(Total Time: {new_elapsed_str})"
                 if updated_desc:
                     updated_desc = f"{updated_desc} {total_time_snippet}".strip()
                 else:
@@ -255,6 +278,7 @@ def webhook():
     except Exception as e:
         app.logger.error(f"Error in webhook processing: {e}")
         return jsonify({"error": "Internal server error."}), 500
+
 
 def update_descriptions():
     """Update running tasks' Todoist descriptions to show elapsed time."""
