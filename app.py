@@ -8,6 +8,10 @@ import hashlib
 import base64
 import requests
 
+# New imports for scheduling and regex
+from apscheduler.schedulers.background import BackgroundScheduler
+import re
+
 # Load environment variables from .env
 load_dotenv()
 
@@ -58,7 +62,10 @@ def post_todoist_comment(task_id, content):
         if response.status_code in (200, 201):
             app.logger.info(f"Successfully posted comment to task {task_id}: {content}")
         else:
-            app.logger.error(f"Failed to post comment to task {task_id}. Status code: {response.status_code}, Response: {response.text}")
+            app.logger.error(
+                f"Failed to post comment to task {task_id}. "
+                f"Status code: {response.status_code}, Response: {response.text}"
+            )
     except Exception as e:
         app.logger.error(f"Error posting comment to Todoist: {e}")
 
@@ -157,6 +164,83 @@ def webhook():
         app.logger.error(f"Error in webhook processing: {e}")
         return jsonify({"error": "Internal server error."}), 500
 
+def update_descriptions():
+    """Update running tasks' Todoist descriptions to show elapsed time."""
+    now = datetime.datetime.now()
+
+    for timer_key, data in timers.items():
+        # timer_key might be "user_id:task_id"
+        try:
+            user_id, task_id = timer_key.split(":")
+        except ValueError:
+            app.logger.error(f"Timer key '{timer_key}' is invalid.")
+            continue
+
+        start_time = data.get("start_time")
+        if not start_time:
+            continue
+
+        # Calculate elapsed time in minutes
+        elapsed = now - start_time
+        elapsed_minutes = int(elapsed.total_seconds() // 60)
+
+        # 1) Fetch the task's current description
+        get_url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
+        headers = {
+            "Authorization": f"Bearer {TODOIST_API_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        get_resp = requests.get(get_url, headers=headers)
+        if get_resp.status_code != 200:
+            app.logger.error(
+                f"Failed to fetch task {task_id}. "
+                f"Status: {get_resp.status_code}, Resp: {get_resp.text}"
+            )
+            continue
+
+        task_data = get_resp.json()
+        current_description = task_data.get("description", "")
+
+        # 2) Remove any old "(Timer Running: X minutes)" snippet
+        pattern = r"\(Timer Running: \d+ minutes\)"
+        updated_description = re.sub(pattern, "", current_description).strip()
+
+        # 3) Append the new snippet
+        timer_snippet = f"(Timer Running: {elapsed_minutes} minutes)"
+        updated_description = (
+            f"{updated_description} {timer_snippet}".strip()
+            if updated_description
+            else timer_snippet
+        )
+
+        # 4) Update the task using POST /rest/v2/tasks/{task_id} (per Todoist docs)
+        update_url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
+        payload = {"description": updated_description}
+        update_resp = requests.post(update_url, headers=headers, json=payload)
+
+        # On success, Todoist returns HTTP 200
+        if update_resp.status_code != 200:
+            app.logger.error(
+                f"Failed to update task {task_id} with new description. "
+                f"Status: {update_resp.status_code}, Response: {update_resp.text}"
+            )
+        else:
+            app.logger.info(
+                f"Successfully updated task {task_id} description to: {updated_description}"
+            )
+
+def start_scheduler():
+    """Start the APScheduler background job to update descriptions every 5 minutes."""
+    scheduler = BackgroundScheduler(daemon=True)
+    scheduler.add_job(
+        func=update_descriptions,
+        trigger="interval",
+        minutes=1
+    )
+    scheduler.start()
+
 if __name__ == '__main__':
+    # Start the scheduler
+    start_scheduler()
     # Run the Flask app
     app.run(port=5001, host='0.0.0.0')
