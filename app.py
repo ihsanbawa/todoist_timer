@@ -190,6 +190,23 @@ def webhook():
 
             timers[timer_key] = {"start_time": datetime.datetime.now()}
             app.logger.info(f"Timer started for key: {timer_key}")
+
+            # INSTANT FEEDBACK: Immediately update task description with "(Timer Running: 0 minutes)"
+            current_desc = get_current_description(task_id)
+            if current_desc is not None:
+                # Remove any old snippet
+                pattern = r"\(Timer Running: \d+ minutes\)"
+                updated_desc = re.sub(pattern, "", current_desc).strip()
+
+                # Add snippet for immediate feedback
+                timer_snippet = "(Timer Running: 0 minutes)"
+                if updated_desc:
+                    updated_desc = f"{updated_desc} {timer_snippet}".strip()
+                else:
+                    updated_desc = timer_snippet
+
+                update_todoist_description(task_id, updated_desc)
+
             return jsonify({"message": "Timer started."}), 200
 
         elif "stop timer" in comment_text:
@@ -279,12 +296,12 @@ def update_descriptions():
         update_todoist_description(task_id, updated_description)
 
 def start_scheduler():
-    """Start the APScheduler background job to update descriptions every X minutes."""
+    """Start the APScheduler background job to update descriptions every 1 minute."""
     scheduler = BackgroundScheduler(daemon=True)
     scheduler.add_job(
         func=update_descriptions,
         trigger="interval",
-        minutes=5  # Change to 1, 2, etc., if you prefer
+        minutes=1  # Changed to 1 minute for quicker testing
     )
     scheduler.start()
 
