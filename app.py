@@ -374,7 +374,7 @@ def webhook():
                             app.logger.info(
                                 f"Logged completion of task {task_id} to Beeminder goal '{goal}'."
                             )
-                    except Exception as e:
+     except Exception as e:
                         app.logger.error(f"Error sending datapoint to Beeminder: {e}")
             return jsonify({"message": "Completion processed"}), 200
 

@@ -33,7 +33,6 @@ def setup_in_memory_db():
     app.config["DB_PATH"] = path
     init_db()
 
-
 def test_database_persistence():
     """Verify that task links persist across database reinitialization."""
     fd, path = tempfile.mkstemp()
