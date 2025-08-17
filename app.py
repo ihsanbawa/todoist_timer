@@ -7,38 +7,55 @@ import hmac
 import hashlib
 import base64
 import requests
-
-# New imports for scheduling and regex
 from apscheduler.schedulers.background import BackgroundScheduler
 import re
 
-# ---- NEW: MySQL driver ----
+# ---- MySQL driver ----
 import pymysql
 from urllib.parse import urlparse
 
-# Load environment variables from .env
+# ============================
+# Bootstrap / Logging
+# ============================
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
+
 app = Flask(__name__)
 
 # In-memory store for timers
 timers = {}
 
 # ============================
-# Database (MySQL) utilities
+# Env helpers
+# ============================
+def require_env(name: str) -> str | None:
+    val = os.getenv(name)
+    if not val:
+        app.logger.warning(f"ENV MISSING: {name} is not set")
+    return val
+
+# Cache tokens once at startup (we still validate presence at use-sites)
+TODOIST_API_BASE_URL = "https://api.todoist.com/rest/v2"
+TODOIST_API_TOKEN = require_env("TODOIST_API_TOKEN")
+BEEMINDER_AUTH_TOKEN = require_env("BEEMINDER_AUTH_TOKEN")
+
+if not TODOIST_API_TOKEN:
+    raise RuntimeError("TODOIST_API_TOKEN not found in environment variables.")
+
+# ============================
+# MySQL utilities
 # ============================
 def _parse_mysql_from_env():
     """
     Support either a single MYSQL_URL or individual MYSQL* vars
     (Railway provides both). Returns dict usable by PyMySQL.
     """
-    url = os.getenv("MYSQL_URL") or os.getenv("JAWSDB_URL")  # JIC other addons
+    url = os.getenv("MYSQL_URL") or os.getenv("JAWSDB_URL")
     if url:
         u = urlparse(url)
         return {
@@ -62,7 +79,7 @@ DB_CFG = _parse_mysql_from_env()
 def get_db_connection():
     """
     Return a new MySQL connection. We open/close per call to be
-    thread-safe with APScheduler.
+    thread-safe with APScheduler and Flask's default threaded server.
     """
     conn = pymysql.connect(
         host=DB_CFG["host"],
@@ -70,8 +87,9 @@ def get_db_connection():
         user=DB_CFG["user"],
         password=DB_CFG["password"],
         database=DB_CFG["database"],
-        autocommit=True,  # we control explicit commits only where needed
+        autocommit=True,
         cursorclass=pymysql.cursors.DictCursor,
+        charset="utf8mb4",
     )
     return conn
 
@@ -89,6 +107,12 @@ def init_db():
     finally:
         conn.close()
 
+# Ensure the database exists on import
+init_db()
+
+# ============================
+# DB operations
+# ============================
 def add_task_link(task_id: str, goal_slug: str) -> None:
     """Upsert mapping of task_id -> goal_slug (MySQL REPLACE keeps your logic)."""
     conn = get_db_connection()
@@ -119,25 +143,15 @@ def get_task_link(task_id: str):
     finally:
         conn.close()
 
-# Ensure the database exists on import
-init_db()
-
 # ============================
-# Todoist / App logic
+# Todoist helpers
 # ============================
-TODOIST_API_BASE_URL = "https://api.todoist.com/rest/v2"
-TODOIST_API_TOKEN = os.getenv("TODOIST_API_TOKEN")
-
-if not TODOIST_API_TOKEN:
-    raise RuntimeError("TODOIST_API_TOKEN not found in environment variables.")
-
-def validate_hmac(payload, received_hmac):
+def validate_hmac(payload: bytes, received_hmac: str) -> bool:
     """Validate the HMAC signature in the request."""
     client_secret = os.getenv("TODOIST_CLIENT_SECRET")
     if not client_secret:
         app.logger.error("TODOIST_CLIENT_SECRET not found in environment variables.")
         return False
-
     try:
         expected_hmac = hmac.new(client_secret.encode(), payload, hashlib.sha256).digest()
         expected_hmac_b64 = base64.b64encode(expected_hmac).decode()
@@ -155,13 +169,13 @@ def post_todoist_comment(task_id, content):
             "Content-Type": "application/json"
         }
         payload = {"task_id": task_id, "content": content}
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
         if response.status_code in (200, 201):
-            app.logger.info(f"Successfully posted comment to task {task_id}: {content}")
+            app.logger.info(f"Posted comment to task {task_id}: {content}")
         else:
             app.logger.error(
                 f"Failed to post comment to task {task_id}. "
-                f"Status code: {response.status_code}, Response: {response.text}"
+                f"Status: {response.status_code}, Body: {response.text}"
             )
     except Exception as e:
         app.logger.error(f"Error posting comment to Todoist: {e}")
@@ -175,14 +189,14 @@ def update_todoist_description(task_id, new_description):
             "Content-Type": "application/json"
         }
         payload = {"description": new_description}
-        response = requests.post(update_url, headers=headers, json=payload)
+        response = requests.post(update_url, headers=headers, json=payload, timeout=10)
         if response.status_code != 200:
             app.logger.error(
                 f"Failed to update task {task_id} description. "
-                f"Status: {response.status_code}, Response: {response.text}"
+                f"Status: {response.status_code}, Body: {response.text}"
             )
             return False
-        app.logger.info(f"Successfully updated task {task_id} description to: {new_description}")
+        app.logger.info(f"Updated task {task_id} description to: {new_description}")
         return True
     except Exception as e:
         app.logger.error(f"Error updating Todoist description: {e}")
@@ -196,11 +210,11 @@ def get_current_description(task_id):
             "Authorization": f"Bearer {TODOIST_API_TOKEN}",
             "Content-Type": "application/json"
         }
-        resp = requests.get(get_url, headers=headers)
+        resp = requests.get(get_url, headers=headers, timeout=10)
         if resp.status_code != 200:
             app.logger.error(
                 f"Failed to fetch task {task_id}. "
-                f"Status: {resp.status_code}, Response: {resp.text}"
+                f"Status: {resp.status_code}, Body: {resp.text}"
             )
             return None
         task_data = resp.json()
@@ -209,11 +223,49 @@ def get_current_description(task_id):
         app.logger.error(f"Error fetching Todoist task description: {e}")
         return None
 
+def extract_task_id(event_data: dict):
+    """
+    Todoist webhooks can place the task id in different keys depending on event type.
+    Try several likely locations and log what we see.
+    """
+    candidates = [
+        event_data.get("id"),
+        event_data.get("task_id"),
+        event_data.get("item_id"),
+        (event_data.get("item") or {}).get("id"),
+        (event_data.get("item") or {}).get("task_id"),
+    ]
+    for c in candidates:
+        if c:
+            return str(c)
+    return None
+
+# ============================
+# Beeminder helpers
+# ============================
+def send_beeminder_plus_one(goal_slug: str, task_id: str, requestid: str) -> bool:
+    if not BEEMINDER_AUTH_TOKEN:
+        app.logger.error("[Beeminder] BEEMINDER_AUTH_TOKEN missing; cannot send to Beeminder.")
+        return False
+    url = f"https://www.beeminder.com/api/v1/users/me/goals/{goal_slug}/datapoints.json"
+    payload = {"value": 1, "auth_token": BEEMINDER_AUTH_TOKEN, "requestid": requestid}
+    app.logger.info(f"[Beeminder] POST {url} data={payload}")
+    try:
+        r = requests.post(url, data=payload, timeout=10)
+        app.logger.info(f"[Beeminder] status={r.status_code} body={r.text}")
+        return r.status_code in (200, 201)
+    except Exception as e:
+        app.logger.exception(f"[Beeminder] exception: {e}")
+        return False
+
+# ============================
+# Flask routes
+# ============================
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
         app.logger.info("Received webhook request.")
-        app.logger.info(f"Request Headers: {request.headers}")
+        app.logger.info(f"Request Headers: {dict(request.headers)}")
         app.logger.info(f"Raw Request Data: {request.data}")
 
         received_hmac = request.headers.get("X-Todoist-Hmac-SHA256", "")
@@ -242,9 +294,12 @@ def webhook():
             app.logger.error("Missing event_data in payload.")
             return jsonify({"error": "Missing event_data in payload."}), 400
 
+        # ---------------------------
+        # NOTE: commands via comments
+        # ---------------------------
         if event_name == "note:added":
-            task_id = event_data.get("item", {}).get("id")
-            user_id = event_data.get("item", {}).get("user_id")
+            task_id = (event_data.get("item") or {}).get("id")
+            user_id = (event_data.get("item") or {}).get("user_id")
             comment_text = event_data.get("content", "").lower()
 
             if not task_id or not user_id:
@@ -256,15 +311,17 @@ def webhook():
                 match = re.search(r"add to beeminder\s+(\S+)", comment_text)
                 if match:
                     goal = match.group(1)
-                    add_task_link(task_id, goal)
+                    add_task_link(str(task_id), goal)
                     post_todoist_comment(task_id, f"Task linked to goal '{goal}'.")
                     return jsonify({"message": "Task linked"}), 200
+
             elif comment_text.startswith("remove from beeminder"):
-                remove_task_link(task_id)
+                remove_task_link(str(task_id))
                 post_todoist_comment(task_id, "Task unlinked from Beeminder.")
                 return jsonify({"message": "Task unlinked"}), 200
+
             elif comment_text.startswith("beeminder status"):
-                goal = get_task_link(task_id)
+                goal = get_task_link(str(task_id))
                 if goal:
                     post_todoist_comment(task_id, f"Task linked to goal '{goal}'.")
                 else:
@@ -344,50 +401,46 @@ def webhook():
             app.logger.info("No action taken for the comment.")
             return jsonify({"message": "No action taken."}), 200
 
+        # ---------------------------
+        # NOTE: Task completed → Beeminder +1
+        # ---------------------------
         elif event_name == "item:completed":
-            # Handle task completion: send datapoint to Beeminder if linked
-            task_id = (
-                event_data.get("id")
-                or event_data.get("item", {}).get("id")
-                or event_data.get("task_id")
-            )
+            app.logger.info(f"[Completed] raw event_data keys: {list(event_data.keys())}")
+            task_id = extract_task_id(event_data)
+            app.logger.info(f"[Completed] extracted task_id={task_id}")
+
             if not task_id:
-                app.logger.error("Missing task_id in completion event.")
-                return jsonify({"message": "Completion processed"}), 200
+                app.logger.error("[Completed] Could not extract task_id from event_data")
+                return jsonify({"message": "Completion processed (no task id)"}), 200
 
             goal = get_task_link(task_id)
-            if goal:
-                auth_token = os.getenv("BEEMINDER_AUTH_TOKEN")
-                if not auth_token:
-                    app.logger.error("BEEMINDER_AUTH_TOKEN not found in environment.")
-                else:
-                    url = f"https://www.beeminder.com/api/v1/users/me/goals/{goal}/datapoints.json"
-                    requestid = data.get("event_id", f"{task_id}-{datetime.datetime.utcnow().timestamp()}")
-                    payload = {"value": 1, "auth_token": auth_token, "requestid": requestid}
-                    try:
-                        response = requests.post(url, data=payload)
-                        if response.status_code not in (200, 201):
-                            app.logger.error(
-                                f"Failed to send datapoint to Beeminder: {response.status_code} {response.text}"
-                            )
-                    except Exception as e:
-                        app.logger.error(f"Error sending datapoint to Beeminder: {e}")
-            return jsonify({"message": "Completion processed"}), 200
+            app.logger.info(f"[Completed] db goal for task_id={task_id}: {goal}")
+
+            if not goal:
+                app.logger.warning(f"[Completed] No goal linked for task {task_id}. Skipping Beeminder.")
+                return jsonify({"message": "Completion processed (no linked goal)"}), 200
+
+            requestid = data.get("event_id") or f"{task_id}-{datetime.datetime.utcnow().timestamp()}"
+            ok = send_beeminder_plus_one(goal_slug=goal, task_id=task_id, requestid=requestid)
+            return jsonify({"message": "Completion processed", "beeminder_ok": ok}), 200
 
         else:
             app.logger.info(f"Unhandled event type: {event_name}")
             return jsonify({"message": "Event not handled"}), 200
 
     except Exception as e:
-        app.logger.error(f"Error in webhook processing: {e}")
+        app.logger.exception(f"Error in webhook processing: {e}")
         return jsonify({"error": "Internal server error."}), 500
 
+# ============================
+# Background timer updater
+# ============================
 def update_descriptions():
     """Update running tasks' Todoist descriptions to show elapsed time."""
     now = datetime.datetime.now()
     for timer_key, data in list(timers.items()):
         try:
-            user_id, task_id = timer_key.split(":")
+            _, task_id = timer_key.split(":")
         except ValueError:
             app.logger.error(f"Timer key '{timer_key}' is invalid.")
             continue
@@ -415,8 +468,33 @@ def start_scheduler():
     scheduler.add_job(func=update_descriptions, trigger="interval", minutes=1)
     scheduler.start()
 
+# ============================
+# Temporary debug endpoints
+# ============================
+@app.get("/healthz")
+def healthz():
+    # Quick probe to ensure service is alive and DB reachable
+    try:
+        _ = get_task_link("nonexistent")
+        db_ok = True
+    except Exception as e:
+        db_ok = False
+        app.logger.exception(f"/healthz DB check failed: {e}")
+    return {"ok": True, "db": db_ok}
+
+@app.get("/debug/beeminder")
+def debug_beeminder():
+    # Hit: /debug/beeminder?goal=<goal-slug>
+    goal = request.args.get("goal")
+    if not goal:
+        return {"error": "pass ?goal="}, 400
+    rid = f"manual-{datetime.datetime.utcnow().timestamp()}"
+    ok = send_beeminder_plus_one(goal, "manual", rid)
+    return {"sent": ok}
+
+# ============================
+# Main
+# ============================
 if __name__ == '__main__':
-    # Start the scheduler
     start_scheduler()
-    # Run the Flask app
     app.run(port=5001, host='0.0.0.0')
