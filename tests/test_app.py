@@ -12,7 +12,6 @@ os.environ.setdefault("TODOIST_CLIENT_SECRET", "secret")
 fd, default_db_path = tempfile.mkstemp()
 os.close(fd)
 os.environ.setdefault("TASK_LINK_DB", default_db_path)
-
 from app import app, timers, init_db, get_task_link, add_task_link
 
 @pytest.fixture
