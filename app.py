@@ -7,11 +7,14 @@ import hmac
 import hashlib
 import base64
 import requests
-import sqlite3
 
 # New imports for scheduling and regex
 from apscheduler.schedulers.background import BackgroundScheduler
 import re
+
+# ---- NEW: MySQL driver ----
+import pymysql
+from urllib.parse import urlparse
 
 # Load environment variables from .env
 load_dotenv()
@@ -20,72 +23,113 @@ load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler()  # Logs will be viewable in your environment (e.g. Railway)
-    ]
+    handlers=[logging.StreamHandler()]
 )
 app = Flask(__name__)
 
 # In-memory store for timers
 timers = {}
 
-# Database configuration for linking Todoist tasks to Beeminder goals
-DB_PATH = os.getenv("TASK_LINK_DB", "task_links.db")
-app.config["DB_PATH"] = DB_PATH
+# ============================
+# Database (MySQL) utilities
+# ============================
+def _parse_mysql_from_env():
+    """
+    Support either a single MYSQL_URL or individual MYSQL* vars
+    (Railway provides both). Returns dict usable by PyMySQL.
+    """
+    url = os.getenv("MYSQL_URL") or os.getenv("JAWSDB_URL")  # JIC other addons
+    if url:
+        u = urlparse(url)
+        return {
+            "host": u.hostname,
+            "port": u.port or 3306,
+            "user": u.username,
+            "password": u.password,
+            "database": u.path.lstrip("/"),
+        }
+    # Fallback to individual vars
+    return {
+        "host": os.getenv("MYSQLHOST", "localhost"),
+        "port": int(os.getenv("MYSQLPORT", "3306")),
+        "user": os.getenv("MYSQLUSER"),
+        "password": os.getenv("MYSQLPASSWORD"),
+        "database": os.getenv("MYSQLDATABASE") or os.getenv("MYSQL_DATABASE"),
+    }
 
+DB_CFG = _parse_mysql_from_env()
+
+def get_db_connection():
+    """
+    Return a new MySQL connection. We open/close per call to be
+    thread-safe with APScheduler.
+    """
+    conn = pymysql.connect(
+        host=DB_CFG["host"],
+        port=DB_CFG["port"],
+        user=DB_CFG["user"],
+        password=DB_CFG["password"],
+        database=DB_CFG["database"],
+        autocommit=True,  # we control explicit commits only where needed
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+    return conn
+
+def init_db():
+    """Initialize the MySQL table for task links."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS task_link (
+                    task_id VARCHAR(64) PRIMARY KEY,
+                    goal_slug VARCHAR(255)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+    finally:
+        conn.close()
+
+def add_task_link(task_id: str, goal_slug: str) -> None:
+    """Upsert mapping of task_id -> goal_slug (MySQL REPLACE keeps your logic)."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "REPLACE INTO task_link (task_id, goal_slug) VALUES (%s, %s)",
+                (task_id, goal_slug),
+            )
+    finally:
+        conn.close()
+
+def remove_task_link(task_id: str) -> None:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM task_link WHERE task_id = %s", (task_id,))
+    finally:
+        conn.close()
+
+def get_task_link(task_id: str):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT goal_slug FROM task_link WHERE task_id = %s", (task_id,))
+            row = cur.fetchone()
+            return row["goal_slug"] if row else None
+    finally:
+        conn.close()
+
+# Ensure the database exists on import
+init_db()
+
+# ============================
+# Todoist / App logic
+# ============================
 TODOIST_API_BASE_URL = "https://api.todoist.com/rest/v2"
 TODOIST_API_TOKEN = os.getenv("TODOIST_API_TOKEN")
 
 if not TODOIST_API_TOKEN:
     raise RuntimeError("TODOIST_API_TOKEN not found in environment variables.")
-
-
-def get_db_connection():
-    """Return a SQLite connection using the configured DB path."""
-    conn = sqlite3.connect(app.config["DB_PATH"])
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    """Initialize the SQLite database for task links."""
-    conn = get_db_connection()
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS task_link (task_id TEXT PRIMARY KEY, goal_slug TEXT)"
-    )
-    conn.commit()
-    conn.close()
-
-
-def add_task_link(task_id: str, goal_slug: str) -> None:
-    """Persist a mapping of task_id -> goal_slug."""
-    conn = get_db_connection()
-    conn.execute(
-        "REPLACE INTO task_link (task_id, goal_slug) VALUES (?, ?)", (task_id, goal_slug)
-    )
-    conn.commit()
-    conn.close()
-
-
-def remove_task_link(task_id: str) -> None:
-    """Remove a mapping for the given task_id."""
-    conn = get_db_connection()
-    conn.execute("DELETE FROM task_link WHERE task_id = ?", (task_id,))
-    conn.commit()
-    conn.close()
-
-
-def get_task_link(task_id: str):
-    """Return the goal_slug mapped to the task_id, or None."""
-    conn = get_db_connection()
-    cur = conn.execute("SELECT goal_slug FROM task_link WHERE task_id = ?", (task_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row["goal_slug"] if row else None
-
-
-# Ensure the database exists on import
-init_db()
 
 def validate_hmac(payload, received_hmac):
     """Validate the HMAC signature in the request."""
@@ -95,11 +139,8 @@ def validate_hmac(payload, received_hmac):
         return False
 
     try:
-        # Generate expected HMAC
         expected_hmac = hmac.new(client_secret.encode(), payload, hashlib.sha256).digest()
         expected_hmac_b64 = base64.b64encode(expected_hmac).decode()
-
-        # Compare HMACs
         return hmac.compare_digest(received_hmac, expected_hmac_b64)
     except Exception as e:
         app.logger.error(f"Error validating HMAC: {e}")
@@ -113,10 +154,7 @@ def post_todoist_comment(task_id, content):
             "Authorization": f"Bearer {TODOIST_API_TOKEN}",
             "Content-Type": "application/json"
         }
-        payload = {
-            "task_id": task_id,
-            "content": content
-        }
+        payload = {"task_id": task_id, "content": content}
         response = requests.post(url, json=payload, headers=headers)
         if response.status_code in (200, 201):
             app.logger.info(f"Successfully posted comment to task {task_id}: {content}")
@@ -129,10 +167,7 @@ def post_todoist_comment(task_id, content):
         app.logger.error(f"Error posting comment to Todoist: {e}")
 
 def update_todoist_description(task_id, new_description):
-    """
-    Helper function to update a Todoist task's description
-    using the official POST /rest/v2/tasks/{task_id} endpoint.
-    """
+    """Update a Todoist task's description."""
     try:
         update_url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
         headers = {
@@ -141,14 +176,12 @@ def update_todoist_description(task_id, new_description):
         }
         payload = {"description": new_description}
         response = requests.post(update_url, headers=headers, json=payload)
-
         if response.status_code != 200:
             app.logger.error(
                 f"Failed to update task {task_id} description. "
                 f"Status: {response.status_code}, Response: {response.text}"
             )
             return False
-
         app.logger.info(f"Successfully updated task {task_id} description to: {new_description}")
         return True
     except Exception as e:
@@ -164,14 +197,12 @@ def get_current_description(task_id):
             "Content-Type": "application/json"
         }
         resp = requests.get(get_url, headers=headers)
-
         if resp.status_code != 200:
             app.logger.error(
                 f"Failed to fetch task {task_id}. "
                 f"Status: {resp.status_code}, Response: {resp.text}"
             )
             return None
-
         task_data = resp.json()
         return task_data.get("description", "")
     except Exception as e:
@@ -181,12 +212,10 @@ def get_current_description(task_id):
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        # Log receipt of webhook
         app.logger.info("Received webhook request.")
         app.logger.info(f"Request Headers: {request.headers}")
         app.logger.info(f"Raw Request Data: {request.data}")
 
-        # Validate HMAC
         received_hmac = request.headers.get("X-Todoist-Hmac-SHA256", "")
         if not received_hmac:
             app.logger.error("Missing HMAC signature in headers.")
@@ -196,7 +225,6 @@ def webhook():
             app.logger.error("Invalid HMAC signature.")
             return jsonify({"error": "Unauthorized"}), 401
 
-        # Parse JSON payload
         data = request.get_json()
         if not data:
             app.logger.error("Empty or invalid JSON payload.")
@@ -209,7 +237,6 @@ def webhook():
             app.logger.error("Missing event_name in payload.")
             return jsonify({"error": "Missing event_name in payload."}), 400
 
-        # Extract relevant fields from `event_data`
         event_data = data.get("event_data", {})
         if not event_data:
             app.logger.error("Missing event_data in payload.")
@@ -224,7 +251,7 @@ def webhook():
                 app.logger.error("Invalid payload: Missing task_id or user_id.")
                 return jsonify({"error": "Invalid payload: Missing task_id or user_id."}), 400
 
-            # Handle Beeminder commands
+            # Beeminder link commands
             if comment_text.startswith("add to beeminder"):
                 match = re.search(r"add to beeminder\s+(\S+)", comment_text)
                 if match:
@@ -244,15 +271,12 @@ def webhook():
                     post_todoist_comment(task_id, "Task not linked to Beeminder.")
                 return jsonify({"message": "Status sent"}), 200
 
-            # Log current timers for debugging
-            app.logger.info(f"Current timers: {timers}")
-
             # Timer logic
+            app.logger.info(f"Current timers: {timers}")
             timer_key = f"{user_id}:{task_id}"
             app.logger.info(f"Processing command for key: {timer_key}")
 
             if "start timer" in comment_text:
-                # START TIMER
                 if timer_key in timers:
                     app.logger.info(f"Timer already running for key: {timer_key}")
                     return jsonify({"message": "Timer already running."}), 200
@@ -260,26 +284,17 @@ def webhook():
                 timers[timer_key] = {"start_time": datetime.datetime.now()}
                 app.logger.info(f"Timer started for key: {timer_key}")
 
-                # INSTANT FEEDBACK: Immediately update task description with "(Timer Running: 0 minutes)"
                 current_desc = get_current_description(task_id)
                 if current_desc is not None:
-                    # Remove any old snippet
                     pattern = r"\(Timer Running: \d+ minutes\)"
                     updated_desc = re.sub(pattern, "", current_desc).strip()
-
-                    # Add snippet for immediate feedback
                     timer_snippet = "(Timer Running: 0 minutes)"
-                    if updated_desc:
-                        updated_desc = f"{updated_desc} {timer_snippet}".strip()
-                    else:
-                        updated_desc = timer_snippet
-
+                    updated_desc = f"{updated_desc} {timer_snippet}".strip() if updated_desc else timer_snippet
                     update_todoist_description(task_id, updated_desc)
 
                 return jsonify({"message": "Timer started."}), 200
 
             elif "stop timer" in comment_text:
-                # STOP TIMER
                 if timer_key not in timers:
                     app.logger.info(f"No timer running for key: {timer_key}")
                     post_todoist_comment(task_id, "No timer found to stop.")
@@ -289,29 +304,22 @@ def webhook():
                 elapsed_time = datetime.datetime.now() - start_time
                 del timers[timer_key]
 
-                # Calculate final elapsed time
-                elapsed_seconds = elapsed_time.total_seconds()
+                elapsed_seconds = int(elapsed_time.total_seconds())
                 hours, remainder = divmod(elapsed_seconds, 3600)
                 minutes, seconds = divmod(remainder, 60)
-                elapsed_str = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+                elapsed_str = f"{hours}h {minutes}m {seconds}s"
 
-                # OPTIONAL: Post the elapsed time as a comment (can remove if undesired)
                 post_todoist_comment(task_id, f"Elapsed time: {elapsed_str}")
 
-                # Fetch current description
                 current_desc = get_current_description(task_id)
                 if current_desc is not None:
-                    # Check if there is already a "Total Time" snippet
                     total_time_pattern = r"\(Total Time: (\d+)h (\d+)m (\d+)s\)"
                     match = re.search(total_time_pattern, current_desc)
 
                     if match:
-                        # Extract existing hours, minutes, seconds
                         existing_hours = int(match.group(1))
                         existing_minutes = int(match.group(2))
                         existing_seconds = int(match.group(3))
-
-                        # Add new elapsed time to the existing time
                         total_seconds = (
                             existing_hours * 3600 +
                             existing_minutes * 60 +
@@ -322,20 +330,12 @@ def webhook():
                         new_minutes, new_seconds = divmod(remainder, 60)
                         new_elapsed_str = f"{int(new_hours)}h {int(new_minutes)}m {int(new_seconds)}s"
                     else:
-                        # No existing "Total Time" snippet; use new elapsed time as-is
                         new_elapsed_str = elapsed_str
 
-                    # Remove any existing "Total Time" snippet and "Timer Running" snippet
                     total_time_and_running_pattern = r"\(Total Time: .*?\)|\(Timer Running: .*?\)"
                     updated_desc = re.sub(total_time_and_running_pattern, "", current_desc).strip()
-
-                    # Append the new total time
                     total_time_snippet = f"(Total Time: {new_elapsed_str})"
-                    if updated_desc:
-                        updated_desc = f"{updated_desc} {total_time_snippet}".strip()
-                    else:
-                        updated_desc = total_time_snippet
-
+                    updated_desc = f"{updated_desc} {total_time_snippet}".strip() if updated_desc else total_time_snippet
                     update_todoist_description(task_id, updated_desc)
 
                 app.logger.info(f"Timer stopped for key: {timer_key}. Elapsed time: {elapsed_str}")
@@ -385,9 +385,7 @@ def webhook():
 def update_descriptions():
     """Update running tasks' Todoist descriptions to show elapsed time."""
     now = datetime.datetime.now()
-
-    for timer_key, data in timers.items():
-        # timer_key might be "user_id:task_id"
+    for timer_key, data in list(timers.items()):
         try:
             user_id, task_id = timer_key.split(":")
         except ValueError:
@@ -398,42 +396,27 @@ def update_descriptions():
         if not start_time:
             continue
 
-        # Calculate elapsed time in minutes
         elapsed = now - start_time
         elapsed_minutes = int(elapsed.total_seconds() // 60)
 
-        # 1) Fetch the current task description
         current_description = get_current_description(task_id)
         if current_description is None:
-            continue  # We already logged the error
+            continue
 
-        # 2) Remove any old "(Timer Running: X minutes)" snippet
         pattern = r"\(Timer Running: \d+ minutes\)"
         updated_description = re.sub(pattern, "", current_description).strip()
-
-        # 3) Append the new snippet
         timer_snippet = f"(Timer Running: {elapsed_minutes} minutes)"
-        if updated_description:
-            updated_description = f"{updated_description} {timer_snippet}".strip()
-        else:
-            updated_description = timer_snippet
-
-        # 4) Update the task description
+        updated_description = f"{updated_description} {timer_snippet}".strip() if updated_description else timer_snippet
         update_todoist_description(task_id, updated_description)
 
 def start_scheduler():
     """Start the APScheduler background job to update descriptions every 1 minute."""
     scheduler = BackgroundScheduler(daemon=True)
-    scheduler.add_job(
-        func=update_descriptions,
-        trigger="interval",
-        minutes=1  # Changed to 1 minute for quicker testing
-    )
+    scheduler.add_job(func=update_descriptions, trigger="interval", minutes=1)
     scheduler.start()
 
 if __name__ == '__main__':
     # Start the scheduler
     start_scheduler()
-
     # Run the Flask app
     app.run(port=5001, host='0.0.0.0')
