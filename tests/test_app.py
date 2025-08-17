@@ -36,10 +36,11 @@ def test_start_timer(mock_hmac, client):
     """Test starting a timer."""
     payload = {
         "event_name": "note:added",
+        "user_id": "67890",
         "event_data": {
             "content": "Start Timer",
-            "task_id": "12345",
-            "item": {"id": "n1", "task_id": "12345", "user_id": "67890"}
+            "id": "n1",
+            "item_id": "12345",
         }
     }
     headers = {"X-Todoist-Hmac-SHA256": "mock_signature"}
@@ -57,10 +58,11 @@ def test_stop_timer_with_running_timer(mock_hmac, client):
 
     payload = {
         "event_name": "note:added",
+        "user_id": "67890",
         "event_data": {
             "content": "Stop Timer",
-            "task_id": "12345",
-            "item": {"id": "n1", "task_id": "12345", "user_id": "67890"}
+            "id": "n1",
+            "item_id": "12345",
         }
     }
     headers = {"X-Todoist-Hmac-SHA256": "mock_signature"}
@@ -73,10 +75,11 @@ def test_stop_timer_without_running_timer(mock_hmac, client):
     """Test stopping a timer when no timer is running."""
     payload = {
         "event_name": "note:added",
+        "user_id": "67890",
         "event_data": {
             "content": "Stop Timer",
-            "task_id": "12345",
-            "item": {"id": "n1", "task_id": "12345", "user_id": "67890"}
+            "id": "n1",
+            "item_id": "12345",
         }
     }
     headers = {"X-Todoist-Hmac-SHA256": "mock_signature"}
@@ -117,10 +120,11 @@ def test_add_to_beeminder(mock_comment, mock_hmac, client):
     setup_in_memory_db()
     payload = {
         "event_name": "note:added",
+        "user_id": "u1",
         "event_data": {
             "content": "add to beeminder salah",
-            "task_id": "123",
-            "item": {"id": "n1", "task_id": "123", "user_id": "u1"},
+            "id": "n1",
+            "item_id": "123",
         },
     }
     headers = {"X-Todoist-Hmac-SHA256": "mock"}
@@ -137,10 +141,11 @@ def test_remove_from_beeminder(mock_comment, mock_hmac, client):
     app_module.add_task_link("123", "salah")
     payload = {
         "event_name": "note:added",
+        "user_id": "u1",
         "event_data": {
             "content": "remove from beeminder",
-            "task_id": "123",
-            "item": {"id": "n1", "task_id": "123", "user_id": "u1"},
+            "id": "n1",
+            "item_id": "123",
         },
     }
     headers = {"X-Todoist-Hmac-SHA256": "mock"}
@@ -199,10 +204,11 @@ def test_merge_elapsed_time(mock_update_desc, mock_get_desc, mock_hmac, client):
     # 3) Stop Timer event
     payload = {
         "event_name": "note:added",
+        "user_id": "67890",
         "event_data": {
             "content": "Stop Timer",
-            "task_id": "12345",
-            "item": {"id": "n1", "task_id": "12345", "user_id": "67890"}
+            "id": "n1",
+            "item_id": "12345",
         }
     }
     headers = {"X-Todoist-Hmac-SHA256": "mock_signature"}

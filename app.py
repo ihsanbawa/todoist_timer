@@ -225,12 +225,13 @@ def get_current_description(task_id):
         return None
 
 def extract_task_id(event_data: dict):
-    for key in ("task_id", "id"):
+    # Prefer item_id (comments use this)
+    for key in ("item_id", "task_id", "id"):
         val = event_data.get(key)
         if val:
             return str(val)
     item = event_data.get("item") or {}
-    for key in ("task_id", "id"):
+    for key in ("item_id", "task_id", "id"):
         val = item.get(key)
         if val:
             return str(val)
@@ -292,18 +293,27 @@ def webhook():
         # NOTE: commands via comments
         # ---------------------------
         if event_name == "note:added":
-            task_id = event_data.get("task_id") or (event_data.get("item") or {}).get("task_id")
-            note_id = (event_data.get("item") or {}).get("id")
-            user_id = event_data.get("user_id") or (event_data.get("item") or {}).get("user_id")
-            comment_text = event_data.get("content", "").lower()
+            # The webhook's event_data is a Comment. Task comments have item_id (the task).
+            note_id = event_data.get("id")
+            comment_text = (event_data.get("content") or "").lower()
+
+            # Prefer top-level user_id from the webhook
+            user_id = data.get("user_id")
+
+            # Task comments -> item_id; project comments -> project_id (no task)
+            task_id = event_data.get("item_id")  # <-- key fix
 
             app.logger.info(
                 f"[note:added] user_id={user_id} task_id={task_id} note_id={note_id} content={comment_text!r}"
             )
 
-            if not task_id or not user_id:
-                app.logger.error("Invalid payload: Missing task_id or user_id.")
-                return jsonify({"error": "Invalid payload: Missing task_id or user_id."}), 400
+            if not user_id:
+                app.logger.error("Invalid payload: Missing user_id.")
+                return jsonify({"error": "Invalid payload: Missing user_id."}), 400
+
+            if not task_id:
+                app.logger.info("Comment is not attached to a task (likely a project comment). Ignoring.")
+                return jsonify({"message": "Comment not on a task; ignoring."}), 200
 
             # Beeminder link commands
             if comment_text.startswith("add to beeminder"):
