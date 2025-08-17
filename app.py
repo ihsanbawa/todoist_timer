@@ -107,8 +107,9 @@ def init_db():
     finally:
         conn.close()
 
-# Ensure the database exists on import
-init_db()
+# Ensure the database exists on import unless explicitly skipped
+if not os.getenv("SKIP_DB_INIT"):
+    init_db()
 
 # ============================
 # DB operations
@@ -224,20 +225,15 @@ def get_current_description(task_id):
         return None
 
 def extract_task_id(event_data: dict):
-    """
-    Todoist webhooks can place the task id in different keys depending on event type.
-    Try several likely locations and log what we see.
-    """
-    candidates = [
-        event_data.get("id"),
-        event_data.get("task_id"),
-        event_data.get("item_id"),
-        (event_data.get("item") or {}).get("id"),
-        (event_data.get("item") or {}).get("task_id"),
-    ]
-    for c in candidates:
-        if c:
-            return str(c)
+    for key in ("task_id", "id"):
+        val = event_data.get(key)
+        if val:
+            return str(val)
+    item = event_data.get("item") or {}
+    for key in ("task_id", "id"):
+        val = item.get(key)
+        if val:
+            return str(val)
     return None
 
 # ============================
@@ -296,9 +292,14 @@ def webhook():
         # NOTE: commands via comments
         # ---------------------------
         if event_name == "note:added":
-            task_id = (event_data.get("item") or {}).get("id")
-            user_id = (event_data.get("item") or {}).get("user_id")
+            task_id = event_data.get("task_id") or (event_data.get("item") or {}).get("task_id")
+            note_id = (event_data.get("item") or {}).get("id")
+            user_id = event_data.get("user_id") or (event_data.get("item") or {}).get("user_id")
             comment_text = event_data.get("content", "").lower()
+
+            app.logger.info(
+                f"[note:added] user_id={user_id} task_id={task_id} note_id={note_id} content={comment_text!r}"
+            )
 
             if not task_id or not user_id:
                 app.logger.error("Invalid payload: Missing task_id or user_id.")
@@ -410,6 +411,7 @@ def webhook():
                 return jsonify({"message": "Completion processed (no task id)"}), 200
 
             goal = get_task_link(task_id)
+            app.logger.info(f"[completed] task_id={task_id} goal_slug={goal}")
 
             if not goal:
                 app.logger.warning(
@@ -480,6 +482,39 @@ def start_scheduler():
     scheduler = BackgroundScheduler(daemon=True)
     scheduler.add_job(func=update_descriptions, trigger="interval", minutes=1)
     scheduler.start()
+
+# ============================
+# Debug endpoints
+# ============================
+@app.get("/debug/fix_links")
+def debug_fix_links():
+    """
+    Cleanup task_link table by removing invalid note_id entries.
+    Todoist note ids won't resolve via /tasks/{id}.
+    """
+    conn = get_db_connection()
+    removed = []
+    kept = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT task_id, goal_slug FROM task_link")
+            rows = cur.fetchall()
+            for row in rows:
+                task_id = row["task_id"]
+                resp = requests.get(
+                    f"{TODOIST_API_BASE_URL}/tasks/{task_id}",
+                    headers={"Authorization": f"Bearer {TODOIST_API_TOKEN}"},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    kept.append(task_id)
+                else:
+                    cur.execute("DELETE FROM task_link WHERE task_id=%s", (task_id,))
+                    removed.append(task_id)
+    finally:
+        conn.close()
+
+    return {"removed": removed, "kept": kept}
 
 # ============================
 # Health endpoint

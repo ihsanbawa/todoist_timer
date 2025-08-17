@@ -1,14 +1,16 @@
 import datetime
 import os
 import pytest
-import tempfile
 from unittest.mock import patch, MagicMock
 
 # Ensure required environment variables for importing the app
 os.environ.setdefault("TODOIST_API_TOKEN", "test_token")
 os.environ.setdefault("TODOIST_CLIENT_SECRET", "secret")
+os.environ.setdefault("SKIP_DB_INIT", "1")
 
-from app import app, timers, init_db, get_task_link, add_task_link
+import app as app_module
+app = app_module.app
+timers = app_module.timers
 
 @pytest.fixture
 def client():
@@ -22,11 +24,12 @@ def mock_validate_hmac(payload, received_hmac):
 
 
 def setup_in_memory_db():
-    """Utility to configure an isolated SQLite DB for tests."""
-    fd, path = tempfile.mkstemp()
-    os.close(fd)
-    app.config["DB_PATH"] = path
-    init_db()
+    """Utility to configure an isolated in-memory DB for tests."""
+    store = {}
+    app_module.add_task_link = lambda task_id, goal_slug: store.__setitem__(task_id, goal_slug)
+    app_module.get_task_link = lambda task_id: store.get(task_id)
+    app_module.remove_task_link = lambda task_id: store.pop(task_id, None)
+    return store
 
 @patch("app.validate_hmac", side_effect=mock_validate_hmac)
 def test_start_timer(mock_hmac, client):
@@ -35,7 +38,8 @@ def test_start_timer(mock_hmac, client):
         "event_name": "note:added",
         "event_data": {
             "content": "Start Timer",
-            "item": {"id": "12345", "user_id": "67890"}
+            "task_id": "12345",
+            "item": {"id": "n1", "task_id": "12345", "user_id": "67890"}
         }
     }
     headers = {"X-Todoist-Hmac-SHA256": "mock_signature"}
@@ -55,7 +59,8 @@ def test_stop_timer_with_running_timer(mock_hmac, client):
         "event_name": "note:added",
         "event_data": {
             "content": "Stop Timer",
-            "item": {"id": "12345", "user_id": "67890"}
+            "task_id": "12345",
+            "item": {"id": "n1", "task_id": "12345", "user_id": "67890"}
         }
     }
     headers = {"X-Todoist-Hmac-SHA256": "mock_signature"}
@@ -70,7 +75,8 @@ def test_stop_timer_without_running_timer(mock_hmac, client):
         "event_name": "note:added",
         "event_data": {
             "content": "Stop Timer",
-            "item": {"id": "12345", "user_id": "67890"}
+            "task_id": "12345",
+            "item": {"id": "n1", "task_id": "12345", "user_id": "67890"}
         }
     }
     headers = {"X-Todoist-Hmac-SHA256": "mock_signature"}
@@ -94,7 +100,8 @@ def test_unhandled_event_type(mock_hmac, client):
         "event_name": "task:completed",
         "event_data": {
             "content": "Start Timer",
-            "item": {"id": "12345", "user_id": "67890"}
+            "task_id": "12345",
+            "item": {"id": "n1", "task_id": "12345", "user_id": "67890"}
         }
     }
     headers = {"X-Todoist-Hmac-SHA256": "mock_signature"}
@@ -112,13 +119,14 @@ def test_add_to_beeminder(mock_comment, mock_hmac, client):
         "event_name": "note:added",
         "event_data": {
             "content": "add to beeminder salah",
-            "item": {"id": "123", "user_id": "u1"},
+            "task_id": "123",
+            "item": {"id": "n1", "task_id": "123", "user_id": "u1"},
         },
     }
     headers = {"X-Todoist-Hmac-SHA256": "mock"}
     response = client.post("/webhook", json=payload, headers=headers)
     assert response.status_code == 200
-    assert get_task_link("123") == "salah"
+    assert app_module.get_task_link("123") == "salah"
 
 
 @patch("app.validate_hmac", side_effect=mock_validate_hmac)
@@ -126,18 +134,19 @@ def test_add_to_beeminder(mock_comment, mock_hmac, client):
 def test_remove_from_beeminder(mock_comment, mock_hmac, client):
     """Unlink a task from Beeminder."""
     setup_in_memory_db()
-    add_task_link("123", "salah")
+    app_module.add_task_link("123", "salah")
     payload = {
         "event_name": "note:added",
         "event_data": {
             "content": "remove from beeminder",
-            "item": {"id": "123", "user_id": "u1"},
+            "task_id": "123",
+            "item": {"id": "n1", "task_id": "123", "user_id": "u1"},
         },
     }
     headers = {"X-Todoist-Hmac-SHA256": "mock"}
     response = client.post("/webhook", json=payload, headers=headers)
     assert response.status_code == 200
-    assert get_task_link("123") is None
+    assert app_module.get_task_link("123") is None
 
 
 @patch("app.validate_hmac", side_effect=mock_validate_hmac)
@@ -146,8 +155,9 @@ def test_remove_from_beeminder(mock_comment, mock_hmac, client):
 def test_item_completed_sends_beeminder(mock_post, mock_comment, mock_hmac, client):
     """Completion of a linked task sends a Beeminder datapoint and comment."""
     setup_in_memory_db()
-    add_task_link("123", "salah")
+    app_module.add_task_link("123", "salah")
     os.environ["BEEMINDER_AUTH_TOKEN"] = "token"
+    app_module.BEEMINDER_AUTH_TOKEN = "token"
     mock_post.return_value.status_code = 200
     payload = {
         "event_name": "item:completed",
@@ -191,7 +201,8 @@ def test_merge_elapsed_time(mock_update_desc, mock_get_desc, mock_hmac, client):
         "event_name": "note:added",
         "event_data": {
             "content": "Stop Timer",
-            "item": {"id": "12345", "user_id": "67890"}
+            "task_id": "12345",
+            "item": {"id": "n1", "task_id": "12345", "user_id": "67890"}
         }
     }
     headers = {"X-Todoist-Hmac-SHA256": "mock_signature"}
