@@ -7,13 +7,15 @@ A personal Flask application that listens for Todoist webhooks, starts/stops tim
 - **Start Timer**: Comment "`start timer`" on a Todoist task to begin tracking time.
 - **Stop Timer**: Comment "`stop timer`" on the same task to stop tracking and save the elapsed time.
 - **Automatic Updates**: Task descriptions are updated in the background to show how long a timer has been running or the total accumulated time.
+- **Beeminder Linking**: Comment `add to beeminder <goal_slug>` to map a task to a Beeminder goal. Use `remove from beeminder` to unlink and `beeminder status` to check the mapping.
 - **Security**: Validates webhooks from Todoist via HMAC signatures.
 
 ## How It Works
 
 1. **Webhook Endpoint**:
-   - The application exposes a single `/webhook` endpoint which Todoist calls whenever a note/comment is added to a task.
-   - If the comment contains specific trigger phrases (like `start timer` or `stop timer`), the application processes them accordingly.
+   - The application exposes a single `/webhook` endpoint which Todoist calls for various events.
+   - Comments on tasks trigger timer controls and Beeminder linking.
+   - Task completion events trigger Beeminder datapoints for linked tasks.
 
 2. **Timer Logic**:
    - Uses an in-memory Python dictionary (`timers`) keyed by `user_id:task_id` to track the start times.
@@ -24,7 +26,8 @@ A personal Flask application that listens for Todoist webhooks, starts/stops tim
    - Expects a `.env` file with:
      - `TODOIST_API_TOKEN`
      - `TODOIST_CLIENT_SECRET`
-   - These are used to authenticate requests to Todoist and validate incoming webhooks.
+     - `BEEMINDER_AUTH_TOKEN` *(required for Beeminder integration)*
+   - These are used to authenticate requests to Todoist/Beeminder and validate incoming webhooks.
 
 ## Requirements
 
@@ -89,6 +92,15 @@ pip install -r requirements.txt
 
 - **Multiple Timers**:
   Each user-task combination is tracked independently. Starting a new timer on a different task won’t affect other tasks.
+
+- **Link to Beeminder**:
+  Comment `add to beeminder <goal_slug>` on a task to log its completions to Beeminder.
+
+- **Unlink from Beeminder**:
+  Comment `remove from beeminder` to stop logging to Beeminder.
+
+- **Check Beeminder Status**:
+  Comment `beeminder status` to see whether the task is linked and to which goal.
 
 ## Troubleshooting
 
