@@ -249,10 +249,8 @@ def send_beeminder_plus_one(goal_slug: str, task_id: str, requestid: str) -> boo
         return False
     url = f"https://www.beeminder.com/api/v1/users/me/goals/{goal_slug}/datapoints.json"
     payload = {"value": 1, "auth_token": BEEMINDER_AUTH_TOKEN, "requestid": requestid}
-    app.logger.info(f"[Beeminder] POST {url} data={payload}")
     try:
         r = requests.post(url, data=payload, timeout=10)
-        app.logger.info(f"[Beeminder] status={r.status_code} body={r.text}")
         return r.status_code in (200, 201)
     except Exception as e:
         app.logger.exception(f"[Beeminder] exception: {e}")
@@ -405,23 +403,38 @@ def webhook():
         # NOTE: Task completed → Beeminder +1
         # ---------------------------
         elif event_name == "item:completed":
-            app.logger.info(f"[Completed] raw event_data keys: {list(event_data.keys())}")
             task_id = extract_task_id(event_data)
-            app.logger.info(f"[Completed] extracted task_id={task_id}")
 
             if not task_id:
                 app.logger.error("[Completed] Could not extract task_id from event_data")
                 return jsonify({"message": "Completion processed (no task id)"}), 200
 
             goal = get_task_link(task_id)
-            app.logger.info(f"[Completed] db goal for task_id={task_id}: {goal}")
 
             if not goal:
-                app.logger.warning(f"[Completed] No goal linked for task {task_id}. Skipping Beeminder.")
+                app.logger.warning(
+                    f"[Completed] No goal linked for task {task_id}. Skipping Beeminder."
+                )
                 return jsonify({"message": "Completion processed (no linked goal)"}), 200
 
             requestid = data.get("event_id") or f"{task_id}-{datetime.datetime.utcnow().timestamp()}"
             ok = send_beeminder_plus_one(goal_slug=goal, task_id=task_id, requestid=requestid)
+
+            timestamp = datetime.datetime.utcnow().isoformat()
+            if ok:
+                comment = (
+                    f"Beeminder datapoint +1 sent to goal '{goal}'.\n"
+                    f"Request ID: {requestid}\n"
+                    f"Timestamp: {timestamp} UTC"
+                )
+            else:
+                comment = (
+                    f"Attempted Beeminder +1 to goal '{goal}' but request failed.\n"
+                    f"Request ID: {requestid}\n"
+                    f"Timestamp: {timestamp} UTC"
+                )
+            post_todoist_comment(task_id, comment)
+
             return jsonify({"message": "Completion processed", "beeminder_ok": ok}), 200
 
         else:
@@ -469,7 +482,7 @@ def start_scheduler():
     scheduler.start()
 
 # ============================
-# Temporary debug endpoints
+# Health endpoint
 # ============================
 @app.get("/healthz")
 def healthz():
@@ -481,16 +494,6 @@ def healthz():
         db_ok = False
         app.logger.exception(f"/healthz DB check failed: {e}")
     return {"ok": True, "db": db_ok}
-
-@app.get("/debug/beeminder")
-def debug_beeminder():
-    # Hit: /debug/beeminder?goal=<goal-slug>
-    goal = request.args.get("goal")
-    if not goal:
-        return {"error": "pass ?goal="}, 400
-    rid = f"manual-{datetime.datetime.utcnow().timestamp()}"
-    ok = send_beeminder_plus_one(goal, "manual", rid)
-    return {"sent": ok}
 
 # ============================
 # Main
