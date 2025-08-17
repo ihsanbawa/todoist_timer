@@ -1,7 +1,14 @@
 import datetime
+import os
 import pytest
+import tempfile
 from unittest.mock import patch, MagicMock
-from app import app, timers
+
+# Ensure required environment variables for importing the app
+os.environ.setdefault("TODOIST_API_TOKEN", "test_token")
+os.environ.setdefault("TODOIST_CLIENT_SECRET", "secret")
+
+from app import app, timers, init_db, get_task_link, add_task_link
 
 @pytest.fixture
 def client():
@@ -12,6 +19,14 @@ def client():
 def mock_validate_hmac(payload, received_hmac):
     """Mock HMAC validation to always return True for tests."""
     return True
+
+
+def setup_in_memory_db():
+    """Utility to configure an isolated SQLite DB for tests."""
+    fd, path = tempfile.mkstemp()
+    os.close(fd)
+    app.config["DB_PATH"] = path
+    init_db()
 
 @patch("app.validate_hmac", side_effect=mock_validate_hmac)
 def test_start_timer(mock_hmac, client):
@@ -86,6 +101,65 @@ def test_unhandled_event_type(mock_hmac, client):
     response = client.post("/webhook", json=payload, headers=headers)
     assert response.status_code == 200
     assert b"Event not handled" in response.data
+
+
+@patch("app.validate_hmac", side_effect=mock_validate_hmac)
+@patch("app.post_todoist_comment")
+def test_add_to_beeminder(mock_comment, mock_hmac, client):
+    """Link a task to a Beeminder goal via comment."""
+    setup_in_memory_db()
+    payload = {
+        "event_name": "note:added",
+        "event_data": {
+            "content": "add to beeminder salah",
+            "item": {"id": "123", "user_id": "u1"},
+        },
+    }
+    headers = {"X-Todoist-Hmac-SHA256": "mock"}
+    response = client.post("/webhook", json=payload, headers=headers)
+    assert response.status_code == 200
+    assert get_task_link("123") == "salah"
+
+
+@patch("app.validate_hmac", side_effect=mock_validate_hmac)
+@patch("app.post_todoist_comment")
+def test_remove_from_beeminder(mock_comment, mock_hmac, client):
+    """Unlink a task from Beeminder."""
+    setup_in_memory_db()
+    add_task_link("123", "salah")
+    payload = {
+        "event_name": "note:added",
+        "event_data": {
+            "content": "remove from beeminder",
+            "item": {"id": "123", "user_id": "u1"},
+        },
+    }
+    headers = {"X-Todoist-Hmac-SHA256": "mock"}
+    response = client.post("/webhook", json=payload, headers=headers)
+    assert response.status_code == 200
+    assert get_task_link("123") is None
+
+
+@patch("app.validate_hmac", side_effect=mock_validate_hmac)
+@patch("app.requests.post")
+def test_item_completed_sends_beeminder(mock_post, mock_hmac, client):
+    """Completion of a linked task sends a Beeminder datapoint."""
+    setup_in_memory_db()
+    add_task_link("123", "salah")
+    os.environ["BEEMINDER_AUTH_TOKEN"] = "token"
+    mock_post.return_value.status_code = 200
+    payload = {
+        "event_name": "item:completed",
+        "event_id": "abc123",
+        "event_data": {"id": "123"},
+    }
+    headers = {"X-Todoist-Hmac-SHA256": "mock"}
+    response = client.post("/webhook", json=payload, headers=headers)
+    assert response.status_code == 200
+    assert mock_post.called
+    url = mock_post.call_args[0][0]
+    assert "salah" in url
+    assert mock_post.call_args[1]["data"]["requestid"] == "abc123"
 
 #
 # NEW TEST: Ensures that elapsed times above an hour are correctly merged.
