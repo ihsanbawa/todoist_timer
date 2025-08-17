@@ -141,9 +141,10 @@ def test_remove_from_beeminder(mock_comment, mock_hmac, client):
 
 
 @patch("app.validate_hmac", side_effect=mock_validate_hmac)
+@patch("app.post_todoist_comment")
 @patch("app.requests.post")
-def test_item_completed_sends_beeminder(mock_post, mock_hmac, client):
-    """Completion of a linked task sends a Beeminder datapoint."""
+def test_item_completed_sends_beeminder(mock_post, mock_comment, mock_hmac, client):
+    """Completion of a linked task sends a Beeminder datapoint and comment."""
     setup_in_memory_db()
     add_task_link("123", "salah")
     os.environ["BEEMINDER_AUTH_TOKEN"] = "token"
@@ -160,6 +161,10 @@ def test_item_completed_sends_beeminder(mock_post, mock_hmac, client):
     url = mock_post.call_args[0][0]
     assert "salah" in url
     assert mock_post.call_args[1]["data"]["requestid"] == "abc123"
+    mock_comment.assert_called_once()
+    comment_text = mock_comment.call_args[0][1]
+    assert "Beeminder datapoint +1 sent to goal 'salah'." in comment_text
+    assert "Request ID: abc123" in comment_text
 
 #
 # NEW TEST: Ensures that elapsed times above an hour are correctly merged.
