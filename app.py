@@ -106,6 +106,20 @@ def get_current_description(task_id: str):
         app.logger.error(f"Error fetching Todoist task: {e}")
         return None
 
+def get_task_content(task_id: str) -> str | None:
+    """Fetch the task title/content."""
+    try:
+        url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
+        headers = {"Authorization": f"Bearer {TODOIST_API_TOKEN}", "Content-Type": "application/json"}
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            app.logger.error(f"Failed to fetch task content ({resp.status_code}): {resp.text}")
+            return None
+        return (resp.json().get("content") or "").strip()
+    except Exception as e:
+        app.logger.error(f"Error fetching Todoist task content: {e}")
+        return None
+
 def iso_to_unix(ts: str):
     """Convert ISO8601 string to unix seconds (int)."""
     if not ts:
@@ -163,7 +177,7 @@ def webhook():
         event_data = data.get("event_data") or {}
         app.logger.info(f"Event: {event_name}")
 
-        # ===== Todoist -> Beeminder on task completion =====
+        # ===== Todoist -> Beeminder on task completion (label-triggered) =====
         if event_name == "item:completed":
             task = event_data
             task_id = task.get("id")
@@ -186,16 +200,30 @@ def webhook():
                 app.logger.info("Completed task lacks trigger label; ignoring.")
                 return "", 200
 
-        # ===== Timer controls via comment (note:added) =====
+        # ===== Comment triggers (note:added) =====
         if event_name == "note:added":
             task_id = event_data.get("item", {}).get("id")
             user_id = event_data.get("item", {}).get("user_id")
+            note_id = event_data.get("id")
             comment_text = (event_data.get("content") or "").lower()
+            note_time = event_data.get("posted_at") or event_data.get("posted") or data.get("triggered_at")
+            ts = iso_to_unix(note_time)
 
             if not task_id or not user_id:
                 app.logger.error("Invalid payload: Missing task_id or user_id.")
                 return "", 400
 
+            # --- NEW: "beeminder" comment => +1 to dailyprayers ---
+            if re.search(r"\bbeeminder\b", comment_text):
+                # Try to include the task title in the datapoint comment
+                title = get_task_content(task_id) or "(untitled task)"
+                bm_comment = f"Todoist (comment): {title}"
+                reqid = delivery_id or (f"note:{note_id}" if note_id else None)
+                ok = post_beeminder_datapoint(value=1, comment=bm_comment, timestamp=ts, requestid=reqid)
+                post_todoist_comment(task_id, "Logged to Beeminder via comment ✅" if ok else "Beeminder logging failed ❌")
+                return "", 200
+
+            # --- Existing timer controls ---
             timer_key = f"{user_id}:{task_id}"
             if "start timer" in comment_text:
                 if timer_key in timers:
