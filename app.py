@@ -1,3 +1,4 @@
+# app.py
 from flask import Flask, request, jsonify
 import datetime
 from dotenv import load_dotenv
@@ -7,330 +8,294 @@ import hmac
 import hashlib
 import base64
 import requests
-
-# New imports for scheduling and regex
 from apscheduler.schedulers.background import BackgroundScheduler
 import re
 
-# Load environment variables from .env
+# ============================
+# Bootstrap / Config
+# ============================
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler()  # Logs will be viewable in your environment (e.g. Railway)
-    ]
+    handlers=[logging.StreamHandler()]
 )
 app = Flask(__name__)
 
-# In-memory store for timers
+# In-memory store for timers (resets on restart)
 timers = {}
 
+# ---- Todoist ----
 TODOIST_API_BASE_URL = "https://api.todoist.com/rest/v2"
 TODOIST_API_TOKEN = os.getenv("TODOIST_API_TOKEN")
+TODOIST_CLIENT_SECRET = os.getenv("TODOIST_CLIENT_SECRET")
 
 if not TODOIST_API_TOKEN:
     raise RuntimeError("TODOIST_API_TOKEN not found in environment variables.")
+if not TODOIST_CLIENT_SECRET:
+    app.logger.warning("TODOIST_CLIENT_SECRET not set – HMAC validation will fail.")
 
-def validate_hmac(payload, received_hmac):
-    """Validate the HMAC signature in the request."""
-    client_secret = os.getenv("TODOIST_CLIENT_SECRET")
-    if not client_secret:
-        app.logger.error("TODOIST_CLIENT_SECRET not found in environment variables.")
-        return False
+# Label that triggers Beeminder logging when the task is completed
+TRIGGER_LABEL = (os.getenv("TODOIST_BEEMINDER_LABEL") or "beeminder").lower()
 
+# ---- Beeminder ----
+BEEMINDER_API_BASE = "https://www.beeminder.com/api/v1"
+BEEMINDER_USERNAME = os.getenv("BEEMINDER_USERNAME")
+BEEMINDER_AUTH_TOKEN = os.getenv("BEEMINDER_AUTH_TOKEN")
+BEEMINDER_GOAL_SLUG = os.getenv("BEEMINDER_GOAL_SLUG") or "dailyprayers"
+
+if not (BEEMINDER_USERNAME and BEEMINDER_AUTH_TOKEN):
+    app.logger.warning("BEEMINDER_USERNAME or BEEMINDER_AUTH_TOKEN not set – Beeminder posting will fail.")
+
+# ============================
+# Helpers
+# ============================
+def validate_hmac(payload: bytes, received_hmac: str) -> bool:
+    """
+    Validate Todoist webhook signature:
+    header 'X-Todoist-Hmac-SHA256' == base64(HMAC_SHA256(client_secret, raw_body))
+    """
     try:
-        # Generate expected HMAC
-        expected_hmac = hmac.new(client_secret.encode(), payload, hashlib.sha256).digest()
-        expected_hmac_b64 = base64.b64encode(expected_hmac).decode()
-
-        # Compare HMACs
-        return hmac.compare_digest(received_hmac, expected_hmac_b64)
+        mac = hmac.new(TODOIST_CLIENT_SECRET.encode(), payload, hashlib.sha256).digest()
+        expected = base64.b64encode(mac).decode()
+        return hmac.compare_digest(received_hmac, expected)
     except Exception as e:
         app.logger.error(f"Error validating HMAC: {e}")
         return False
 
-def post_todoist_comment(task_id, content):
+def post_todoist_comment(task_id: str, content: str) -> None:
     """Post a comment to a Todoist task."""
     try:
         url = f"{TODOIST_API_BASE_URL}/comments"
-        headers = {
-            "Authorization": f"Bearer {TODOIST_API_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "task_id": task_id,
-            "content": content
-        }
-        response = requests.post(url, json=payload, headers=headers)
-        if response.status_code in (200, 201):
-            app.logger.info(f"Successfully posted comment to task {task_id}: {content}")
+        headers = {"Authorization": f"Bearer {TODOIST_API_TOKEN}", "Content-Type": "application/json"}
+        resp = requests.post(url, json={"task_id": task_id, "content": content}, headers=headers, timeout=15)
+        if resp.status_code in (200, 201):
+            app.logger.info(f"Comment posted on task {task_id}: {content}")
         else:
-            app.logger.error(
-                f"Failed to post comment to task {task_id}. "
-                f"Status code: {response.status_code}, Response: {response.text}"
-            )
+            app.logger.error(f"Failed to post comment ({resp.status_code}): {resp.text}")
     except Exception as e:
         app.logger.error(f"Error posting comment to Todoist: {e}")
 
-def update_todoist_description(task_id, new_description):
-    """
-    Helper function to update a Todoist task's description
-    using the official POST /rest/v2/tasks/{task_id} endpoint.
-    """
+def update_todoist_description(task_id: str, new_description: str) -> bool:
+    """Update a Todoist task's description."""
     try:
-        update_url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
-        headers = {
-            "Authorization": f"Bearer {TODOIST_API_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        payload = {"description": new_description}
-        response = requests.post(update_url, headers=headers, json=payload)
-
-        if response.status_code != 200:
-            app.logger.error(
-                f"Failed to update task {task_id} description. "
-                f"Status: {response.status_code}, Response: {response.text}"
-            )
+        url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
+        headers = {"Authorization": f"Bearer {TODOIST_API_TOKEN}", "Content-Type": "application/json"}
+        resp = requests.post(url, headers=headers, json={"description": new_description}, timeout=15)
+        if resp.status_code != 200:
+            app.logger.error(f"Failed to update description ({resp.status_code}): {resp.text}")
             return False
-
-        app.logger.info(f"Successfully updated task {task_id} description to: {new_description}")
+        app.logger.info(f"Updated task {task_id} description.")
         return True
     except Exception as e:
         app.logger.error(f"Error updating Todoist description: {e}")
         return False
 
-def get_current_description(task_id):
+def get_current_description(task_id: str):
     """Fetch the current description of a Todoist task."""
     try:
-        get_url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
-        headers = {
-            "Authorization": f"Bearer {TODOIST_API_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        resp = requests.get(get_url, headers=headers)
-
+        url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
+        headers = {"Authorization": f"Bearer {TODOIST_API_TOKEN}", "Content-Type": "application/json"}
+        resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code != 200:
-            app.logger.error(
-                f"Failed to fetch task {task_id}. "
-                f"Status: {resp.status_code}, Response: {resp.text}"
-            )
+            app.logger.error(f"Failed to fetch task ({resp.status_code}): {resp.text}")
             return None
-
-        task_data = resp.json()
-        return task_data.get("description", "")
+        return resp.json().get("description", "")
     except Exception as e:
-        app.logger.error(f"Error fetching Todoist task description: {e}")
+        app.logger.error(f"Error fetching Todoist task: {e}")
         return None
 
+def iso_to_unix(ts: str):
+    """Convert ISO8601 string to unix seconds (int)."""
+    if not ts:
+        return None
+    try:
+        s = ts.replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(s)
+        return int(dt.timestamp())
+    except Exception as e:
+        app.logger.warning(f"Could not parse timestamp '{ts}': {e}")
+        return None
+
+def post_beeminder_datapoint(value: float, comment: str, timestamp: int, requestid: str) -> bool:
+    """Create a datapoint on Beeminder for the configured goal."""
+    if not (BEEMINDER_USERNAME and BEEMINDER_AUTH_TOKEN):
+        app.logger.error("Beeminder credentials missing.")
+        return False
+    try:
+        url = f"{BEEMINDER_API_BASE}/users/{BEEMINDER_USERNAME}/goals/{BEEMINDER_GOAL_SLUG}/datapoints.json"
+        data = {
+            "auth_token": BEEMINDER_AUTH_TOKEN,
+            "value": value,
+            "comment": comment,
+        }
+        if timestamp is not None:
+            data["timestamp"] = timestamp
+        if requestid:
+            data["requestid"] = requestid  # idempotency (avoid duplicates on retries)
+        resp = requests.post(url, data=data, timeout=15)
+        if resp.status_code in (200, 201):
+            app.logger.info(f"Beeminder datapoint OK: {resp.text}")
+            return True
+        app.logger.error(f"Beeminder datapoint FAILED ({resp.status_code}): {resp.text}")
+        return False
+    except Exception as e:
+        app.logger.error(f"Error posting to Beeminder: {e}")
+        return False
+
+# ============================
+# Webhook endpoint
+# ============================
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        # Log receipt of webhook
-        app.logger.info("Received webhook request.")
-        app.logger.info(f"Request Headers: {request.headers}")
-        app.logger.info(f"Raw Request Data: {request.data}")
+        received_hmac = request.headers.get("X-Todoist-Hmac-SHA256", "")
+        delivery_id = request.headers.get("X-Todoist-Delivery-ID")  # unique per event
 
         # Validate HMAC
-        received_hmac = request.headers.get("X-Todoist-Hmac-SHA256", "")
-        if not received_hmac:
-            app.logger.error("Missing HMAC signature in headers.")
-            return jsonify({"error": "Missing HMAC signature."}), 401
+        if not received_hmac or not validate_hmac(request.data, received_hmac):
+            app.logger.error("Invalid or missing HMAC.")
+            return "", 401
 
-        if not validate_hmac(request.data, received_hmac):
-            app.logger.error("Invalid HMAC signature.")
-            return jsonify({"error": "Unauthorized"}), 401
-
-        # Parse JSON payload
-        data = request.get_json()
-        if not data:
-            app.logger.error("Empty or invalid JSON payload.")
-            return jsonify({"error": "Malformed JSON payload."}), 400
-
-        app.logger.info(f"Parsed JSON Payload: {data}")
-
+        data = request.get_json(silent=True) or {}
         event_name = data.get("event_name")
-        if not event_name:
-            app.logger.error("Missing event_name in payload.")
-            return jsonify({"error": "Missing event_name in payload."}), 400
+        event_data = data.get("event_data") or {}
+        app.logger.info(f"Event: {event_name}")
 
-        # We only handle note:added
-        if event_name != "note:added":
-            app.logger.info(f"Unhandled event type: {event_name}")
-            return jsonify({"message": "Event not handled"}), 200
+        # ===== Todoist -> Beeminder on task completion =====
+        if event_name == "item:completed":
+            task = event_data
+            task_id = task.get("id")
+            task_content = (task.get("content") or "").strip()
+            # In Sync v9, labels are names (strings)
+            labels = [str(l).lower() for l in (task.get("labels") or [])]
+            completed_at = task.get("completed_at") or data.get("triggered_at")
+            ts = iso_to_unix(completed_at)
 
-        # Extract relevant fields from `event_data`
-        event_data = data.get("event_data", {})
-        if not event_data:
-            app.logger.error("Missing event_data in payload.")
-            return jsonify({"error": "Missing event_data in payload."}), 400
+            app.logger.info(f"Completed task '{task_content}' ({task_id}); labels={labels}")
 
-        task_id = event_data.get("item", {}).get("id")  # Extract task_id from `item`
-        user_id = event_data.get("item", {}).get("user_id")  # Extract user_id from `item`
-        comment_text = event_data.get("content", "").lower()
+            if TRIGGER_LABEL in labels:
+                bm_comment = f"Todoist: {task_content}"
+                reqid = delivery_id or f"{task_id}:{completed_at or ''}"
+                ok = post_beeminder_datapoint(value=1, comment=bm_comment, timestamp=ts, requestid=reqid)
+                if task_id:
+                    post_todoist_comment(task_id, "Logged to Beeminder ✅" if ok else "Beeminder logging failed ❌")
+                return "", 200
+            else:
+                app.logger.info("Completed task lacks trigger label; ignoring.")
+                return "", 200
 
-        if not task_id or not user_id:
-            app.logger.error("Invalid payload: Missing task_id or user_id.")
-            return jsonify({"error": "Invalid payload: Missing task_id or user_id."}), 400
+        # ===== Timer controls via comment (note:added) =====
+        if event_name == "note:added":
+            task_id = event_data.get("item", {}).get("id")
+            user_id = event_data.get("item", {}).get("user_id")
+            comment_text = (event_data.get("content") or "").lower()
 
-        # Log current timers for debugging
-        app.logger.info(f"Current timers: {timers}")
+            if not task_id or not user_id:
+                app.logger.error("Invalid payload: Missing task_id or user_id.")
+                return "", 400
 
-        # Timer logic
-        timer_key = f"{user_id}:{task_id}"
-        app.logger.info(f"Processing command for key: {timer_key}")
+            timer_key = f"{user_id}:{task_id}"
+            if "start timer" in comment_text:
+                if timer_key in timers:
+                    return "", 200
+                timers[timer_key] = {"start_time": datetime.datetime.now()}
 
-        if "start timer" in comment_text:
-            # START TIMER
-            if timer_key in timers:
-                app.logger.info(f"Timer already running for key: {timer_key}")
-                return jsonify({"message": "Timer already running."}), 200
+                current_desc = get_current_description(task_id)
+                if current_desc is not None:
+                    pattern = r"\(Timer Running: \d+ minutes\)"
+                    updated_desc = re.sub(pattern, "", current_desc).strip()
+                    snippet = "(Timer Running: 0 minutes)"
+                    updated_desc = f"{updated_desc} {snippet}".strip() if updated_desc else snippet
+                    update_todoist_description(task_id, updated_desc)
+                return "", 200
 
-            timers[timer_key] = {"start_time": datetime.datetime.now()}
-            app.logger.info(f"Timer started for key: {timer_key}")
+            if "stop timer" in comment_text:
+                if timer_key not in timers:
+                    post_todoist_comment(task_id, "No timer found to stop.")
+                    return "", 200
 
-            # INSTANT FEEDBACK: Immediately update task description with "(Timer Running: 0 minutes)"
-            current_desc = get_current_description(task_id)
-            if current_desc is not None:
-                # Remove any old snippet
-                pattern = r"\(Timer Running: \d+ minutes\)"
-                updated_desc = re.sub(pattern, "", current_desc).strip()
+                start_time = timers[timer_key]["start_time"]
+                elapsed = datetime.datetime.now() - start_time
+                del timers[timer_key]
 
-                # Add snippet for immediate feedback
-                timer_snippet = "(Timer Running: 0 minutes)"
-                if updated_desc:
-                    updated_desc = f"{updated_desc} {timer_snippet}".strip()
-                else:
-                    updated_desc = timer_snippet
+                elapsed_seconds = int(elapsed.total_seconds())
+                hours, rem = divmod(elapsed_seconds, 3600)
+                minutes, seconds = divmod(rem, 60)
+                elapsed_str = f"{hours}h {minutes}m {seconds}s"
 
-                update_todoist_description(task_id, updated_desc)
+                # Optional comment; remove if you don't want it
+                post_todoist_comment(task_id, f"Elapsed time: {elapsed_str}")
 
-            return jsonify({"message": "Timer started."}), 200
+                current_desc = get_current_description(task_id)
+                if current_desc is not None:
+                    total_time_pattern = r"\(Total Time: (\d+)h (\d+)m (\d+)s\)"
+                    match = re.search(total_time_pattern, current_desc)
+                    if match:
+                        existing_h = int(match.group(1))
+                        existing_m = int(match.group(2))
+                        existing_s = int(match.group(3))
+                        total = existing_h * 3600 + existing_m * 60 + existing_s + elapsed_seconds
+                        nh, rem = divmod(total, 3600)
+                        nm, ns = divmod(rem, 60)
+                        new_total_str = f"{nh}h {nm}m {ns}s"
+                    else:
+                        new_total_str = elapsed_str
 
-        elif "stop timer" in comment_text:
-            # STOP TIMER
-            if timer_key not in timers:
-                app.logger.info(f"No timer running for key: {timer_key}")
-                post_todoist_comment(task_id, "No timer found to stop.")
-                return jsonify({"message": "No timer running for this task."}), 200
+                    strip_pattern = r"\(Total Time: .*?\)|\(Timer Running: .*?\)"
+                    updated_desc = re.sub(strip_pattern, "", current_desc).strip()
+                    snippet = f"(Total Time: {new_total_str})"
+                    updated_desc = f"{updated_desc} {snippet}".strip() if updated_desc else snippet
+                    update_todoist_description(task_id, updated_desc)
 
-            start_time = timers[timer_key]["start_time"]
-            elapsed_time = datetime.datetime.now() - start_time
-            del timers[timer_key]
+                return "", 200
 
-            # Calculate final elapsed time
-            elapsed_seconds = elapsed_time.total_seconds()
-            hours, remainder = divmod(elapsed_seconds, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            elapsed_str = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+            return "", 200
 
-            # OPTIONAL: Post the elapsed time as a comment (can remove if undesired)
-            post_todoist_comment(task_id, f"Elapsed time: {elapsed_str}")
-
-            # Fetch current description
-            current_desc = get_current_description(task_id)
-            if current_desc is not None:
-                # Check if there is already a "Total Time" snippet
-                total_time_pattern = r"\(Total Time: (\d+)h (\d+)m (\d+)s\)"
-                match = re.search(total_time_pattern, current_desc)
-
-                if match:
-                    # Extract existing hours, minutes, seconds
-                    existing_hours = int(match.group(1))
-                    existing_minutes = int(match.group(2))
-                    existing_seconds = int(match.group(3))
-
-                    # Add new elapsed time to the existing time
-                    total_seconds = (
-                        existing_hours * 3600 +
-                        existing_minutes * 60 +
-                        existing_seconds +
-                        elapsed_seconds
-                    )
-                    new_hours, remainder = divmod(total_seconds, 3600)
-                    new_minutes, new_seconds = divmod(remainder, 60)
-                    new_elapsed_str = f"{int(new_hours)}h {int(new_minutes)}m {int(new_seconds)}s"
-                else:
-                    # No existing "Total Time" snippet; use new elapsed time as-is
-                    new_elapsed_str = elapsed_str
-
-                # Remove any existing "Total Time" snippet and "Timer Running" snippet
-                total_time_and_running_pattern = r"\(Total Time: .*?\)|\(Timer Running: .*?\)"
-                updated_desc = re.sub(total_time_and_running_pattern, "", current_desc).strip()
-
-                # Append the new total time
-                total_time_snippet = f"(Total Time: {new_elapsed_str})"
-                if updated_desc:
-                    updated_desc = f"{updated_desc} {total_time_snippet}".strip()
-                else:
-                    updated_desc = total_time_snippet
-
-                update_todoist_description(task_id, updated_desc)
-
-            app.logger.info(f"Timer stopped for key: {timer_key}. Elapsed time: {elapsed_str}")
-            return jsonify({"message": f"Timer stopped. Total time: {elapsed_str}"}), 200
-
-        app.logger.info("No action taken for the comment.")
-        return jsonify({"message": "No action taken."}), 200
+        # Unhandled events
+        app.logger.info(f"Unhandled event: {event_name}")
+        return "", 200
 
     except Exception as e:
-        app.logger.error(f"Error in webhook processing: {e}")
-        return jsonify({"error": "Internal server error."}), 500
+        app.logger.error(f"Webhook error: {e}")
+        return "", 500
 
+# ============================
+# Background job: update running timer snippets every minute
+# ============================
 def update_descriptions():
-    """Update running tasks' Todoist descriptions to show elapsed time."""
     now = datetime.datetime.now()
-
-    for timer_key, data in timers.items():
-        # timer_key might be "user_id:task_id"
+    for timer_key, data in list(timers.items()):
         try:
-            user_id, task_id = timer_key.split(":")
+            _, task_id = timer_key.split(":")
         except ValueError:
-            app.logger.error(f"Timer key '{timer_key}' is invalid.")
+            app.logger.error(f"Bad timer key '{timer_key}'")
             continue
 
         start_time = data.get("start_time")
         if not start_time:
             continue
 
-        # Calculate elapsed time in minutes
-        elapsed = now - start_time
-        elapsed_minutes = int(elapsed.total_seconds() // 60)
-
-        # 1) Fetch the current task description
+        elapsed_minutes = int((now - start_time).total_seconds() // 60)
         current_description = get_current_description(task_id)
         if current_description is None:
-            continue  # We already logged the error
+            continue
 
-        # 2) Remove any old "(Timer Running: X minutes)" snippet
         pattern = r"\(Timer Running: \d+ minutes\)"
         updated_description = re.sub(pattern, "", current_description).strip()
-
-        # 3) Append the new snippet
-        timer_snippet = f"(Timer Running: {elapsed_minutes} minutes)"
-        if updated_description:
-            updated_description = f"{updated_description} {timer_snippet}".strip()
-        else:
-            updated_description = timer_snippet
-
-        # 4) Update the task description
+        snippet = f"(Timer Running: {elapsed_minutes} minutes)"
+        updated_description = f"{updated_description} {snippet}".strip() if updated_description else snippet
         update_todoist_description(task_id, updated_description)
 
 def start_scheduler():
-    """Start the APScheduler background job to update descriptions every 1 minute."""
     scheduler = BackgroundScheduler(daemon=True)
-    scheduler.add_job(
-        func=update_descriptions,
-        trigger="interval",
-        minutes=1  # Changed to 1 minute for quicker testing
-    )
+    scheduler.add_job(func=update_descriptions, trigger="interval", minutes=1)
     scheduler.start()
 
+# ============================
+# Entrypoint
+# ============================
 if __name__ == '__main__':
-    # Start the scheduler
     start_scheduler()
-
-    # Run the Flask app
     app.run(port=5001, host='0.0.0.0')
