@@ -48,8 +48,7 @@ if not TODOIST_API_TOKEN:
 if not TODOIST_CLIENT_SECRET:
     app.logger.warning("TODOIST_CLIENT_SECRET not set – HMAC validation will fail.")
 
-# Label that triggers Beeminder logging when the task is completed
-# Can be a label NAME (e.g., "beeminder") or a numeric ID string.
+# Trigger label that says "log this completion to Beeminder"
 TRIGGER_LABEL_RAW = os.getenv("TODOIST_BEEMINDER_LABEL") or "beeminder"
 TRIGGER_LABEL_NAME = TRIGGER_LABEL_RAW.lower()
 TRIGGER_LABEL_ID = int(TRIGGER_LABEL_RAW) if TRIGGER_LABEL_RAW.isdigit() else None
@@ -58,7 +57,10 @@ TRIGGER_LABEL_ID = int(TRIGGER_LABEL_RAW) if TRIGGER_LABEL_RAW.isdigit() else No
 BEEMINDER_API_BASE = "https://www.beeminder.com/api/v1"
 BEEMINDER_USERNAME = os.getenv("BEEMINDER_USERNAME")
 BEEMINDER_AUTH_TOKEN = os.getenv("BEEMINDER_AUTH_TOKEN")
-BEEMINDER_GOAL_SLUG = os.getenv("BEEMINDER_GOAL_SLUG") or "dailyprayers"
+# Fallback if no goal label present
+BEEMINDER_DEFAULT_GOAL = os.getenv("BEEMINDER_GOAL_SLUG") or os.getenv("BEEMINDER_DEFAULT_GOAL") or "dailyprayers"
+# Optional: validate goal exists before posting (adds a GET)
+BEEMINDER_VALIDATE_GOAL = (os.getenv("BEEMINDER_VALIDATE_GOAL") or "").lower() in ("1", "true", "yes")
 
 if not (BEEMINDER_USERNAME and BEEMINDER_AUTH_TOKEN):
     app.logger.warning("BEEMINDER_USERNAME or BEEMINDER_AUTH_TOKEN not set – Beeminder posting will fail.")
@@ -148,17 +150,24 @@ def get_current_description(task_id: str) -> Optional[str]:
         app.logger.error(f"Error fetching Todoist task: {e}")
         return None
 
-def get_task_content(task_id: str) -> Optional[str]:
-    """Fetch the task title/content (active tasks only; may 404 for completed)."""
+def get_task(task_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch the full task (active tasks only; completed tasks may 404)."""
     try:
         url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
         headers = {"Authorization": f"Bearer {TODOIST_API_TOKEN}", "Content-Type": "application/json"}
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code != 200:
             return None
-        return (resp.json().get("content") or "").strip()
+        return resp.json()
     except Exception:
         return None
+
+def get_task_content(task_id: str) -> Optional[str]:
+    """Fetch the task title/content (active tasks only)."""
+    t = get_task(task_id)
+    if not t:
+        return None
+    return (t.get("content") or "").strip()
 
 def iso_to_unix(ts: Optional[str]) -> Optional[int]:
     if not ts:
@@ -210,13 +219,48 @@ def _coerce_labels_to_names(raw_labels: List[Any]) -> Tuple[List[str], List[int]
     names = [str(x).strip().lower() for x in raw_labels]
     return names, []
 
-def post_beeminder_datapoint(value: float, comment: str, timestamp: Optional[int], requestid: Optional[str]) -> bool:
-    """Create a datapoint on Beeminder for the configured goal (idempotent via requestid)."""
+# ---------- Goal resolution from labels ----------
+_GOAL_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")  # conservative Beeminder slug check
+
+def _goal_from_label_names(label_names: List[str]) -> Optional[str]:
+    """
+    Given lowercase label names, return the goal slug:
+    - Must include TRIGGER_LABEL_NAME ('beeminder').
+    - Choose the first other label that looks like a valid slug.
+    """
+    if TRIGGER_LABEL_NAME not in label_names:
+        return None
+    for name in label_names:
+        if name == TRIGGER_LABEL_NAME:
+            continue
+        if _GOAL_SLUG_RE.match(name):
+            return name
+    return None
+
+def _maybe_validate_goal(slug: str) -> bool:
+    if not BEEMINDER_VALIDATE_GOAL:
+        return True
+    try:
+        url = f"{BEEMINDER_API_BASE}/users/{BEEMINDER_USERNAME}/goals/{slug}.json"
+        resp = requests.get(url, params={"auth_token": BEEMINDER_AUTH_TOKEN}, timeout=15)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+def post_beeminder_datapoint(goal_slug: str, value: float, comment: str,
+                             timestamp: Optional[int], requestid: Optional[str]) -> bool:
+    """Create a datapoint on Beeminder for the given goal (idempotent via requestid)."""
     if not (BEEMINDER_USERNAME and BEEMINDER_AUTH_TOKEN):
         app.logger.error("Beeminder credentials missing.")
         return False
+    if not goal_slug:
+        app.logger.error("Missing goal slug.")
+        return False
+    if not _maybe_validate_goal(goal_slug):
+        app.logger.error(f"Goal '{goal_slug}' did not validate.")
+        return False
     try:
-        url = f"{BEEMINDER_API_BASE}/users/{BEEMINDER_USERNAME}/goals/{BEEMINDER_GOAL_SLUG}/datapoints.json"
+        url = f"{BEEMINDER_API_BASE}/users/{BEEMINDER_USERNAME}/goals/{goal_slug}/datapoints.json"
         data = {"auth_token": BEEMINDER_AUTH_TOKEN, "value": value, "comment": comment}
         if timestamp is not None:
             data["timestamp"] = timestamp
@@ -224,9 +268,9 @@ def post_beeminder_datapoint(value: float, comment: str, timestamp: Optional[int
             data["requestid"] = requestid
         resp = requests.post(url, data=data, timeout=15)
         if resp.status_code in (200, 201):
-            app.logger.info(f"Beeminder datapoint OK: {resp.text}")
+            app.logger.info(f"Beeminder +1 to '{goal_slug}' OK: {resp.text}")
             return True
-        app.logger.error(f"Beeminder datapoint FAILED ({resp.status_code}): {resp.text}")
+        app.logger.error(f"Beeminder datapoint FAILED ({resp.status_code}) for '{goal_slug}': {resp.text}")
         return False
     except Exception as e:
         app.logger.error(f"Error posting to Beeminder: {e}")
@@ -306,7 +350,7 @@ def webhook():
         event_data = body.get("event_data") or {}
         app.logger.info(f"Event: {event_name}")
 
-        # ======= Completion handling (matches community patterns) =======
+        # ======= Completion handling =======
         normalized = _normalize_completion(event_name, body)
         if normalized:
             task_id = normalized["task_id"]
@@ -326,13 +370,27 @@ def webhook():
             if task_id:
                 comment_task_completed(task_id, task_title)
 
-            # If labeled for Beeminder, count +1
-            label_match = (TRIGGER_LABEL_NAME in label_names) or (TRIGGER_LABEL_ID is not None and TRIGGER_LABEL_ID in label_ids)
-            if label_match:
+            # Resolve goal from labels (beeminder + another label = goal slug)
+            goal_slug = _goal_from_label_names(label_names)
+            if not goal_slug:
+                # Also try ID trigger: if trigger was provided as numeric label id
+                if TRIGGER_LABEL_ID is not None and TRIGGER_LABEL_ID in label_ids:
+                    # We still need a goal slug from names (IDs don't tell us which "other" label to use)
+                    # So choose first name that looks like a slug.
+                    goal_slug = next((n for n in label_names if _GOAL_SLUG_RE.match(n)), None)
+
+            # If still none, fall back to default
+            if not goal_slug:
+                app.logger.info(f"No goal label found; using default '{BEEMINDER_DEFAULT_GOAL}'.")
+                goal_slug = BEEMINDER_DEFAULT_GOAL
+
+            # Only post if the trigger is present (name or id)
+            trigger_present = (TRIGGER_LABEL_NAME in label_names) or (TRIGGER_LABEL_ID is not None and TRIGGER_LABEL_ID in label_ids)
+            if trigger_present:
                 bm_comment = f"Todoist: {task_title}"
-                reqid = f"complete:{completion_key}"
-                ok = post_beeminder_datapoint(value=1, comment=bm_comment, timestamp=ts, requestid=reqid)
-                post_todoist_comment(task_id, "Counted ✅" if ok else "Failed to count ❌")
+                reqid = f"complete:{completion_key}:{goal_slug}"
+                ok = post_beeminder_datapoint(goal_slug, value=1, comment=bm_comment, timestamp=ts, requestid=reqid)
+                post_todoist_comment(task_id, ("Counted ✅ → " + goal_slug) if ok else "Failed to count ❌")
 
             return "", 200
 
@@ -356,11 +414,18 @@ def webhook():
 
             # Strict trigger: exactly "beeminder" or "bm" to add +1
             if lowered.strip() in ("beeminder", "bm"):
-                title = get_task_content(task_id) or "(untitled task)"
+                # Pull task to read its labels (active tasks only)
+                task_obj = get_task(task_id) or {}
+                raw_labels = task_obj.get("labels") or []
+                label_names, _ = _coerce_labels_to_names(raw_labels)
+                # Determine goal from labels; fallback default if none
+                goal_slug = _goal_from_label_names(label_names) or BEEMINDER_DEFAULT_GOAL
+
+                title = (task_obj.get("content") or "").strip() or "(untitled task)"
                 bm_comment = f"Todoist (comment): {title}"
-                reqid = f"note:{note_id}" if note_id else f"note:{task_id}:{ts or ''}"
-                ok = post_beeminder_datapoint(value=1, comment=bm_comment, timestamp=ts, requestid=reqid)
-                post_todoist_comment(task_id, "Counted ✅" if ok else "Failed to count ❌")
+                reqid = f"note:{note_id}:{goal_slug}" if note_id else f"note:{task_id}:{ts or ''}:{goal_slug}"
+                ok = post_beeminder_datapoint(goal_slug, value=1, comment=bm_comment, timestamp=ts, requestid=reqid)
+                post_todoist_comment(task_id, ("Counted ✅ → " + goal_slug) if ok else "Failed to count ❌")
                 return "", 200
 
             # Timer controls
@@ -419,7 +484,7 @@ def webhook():
             return "", 200
 
         # Unhandled events
-        app.logger.info(f"Unhandled event: {event_name} (keys: {list(event_data.keys())})")
+        app.logger.info(f"Unhandled event: {event_name}")
         return "", 200
 
     except Exception as e:
