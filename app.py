@@ -1,5 +1,5 @@
 # app.py
-from flask import Flask, request, jsonify
+from flask import Flask, request
 import datetime
 from dotenv import load_dotenv
 import os
@@ -11,6 +11,8 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 import re
 from collections import OrderedDict
+from typing import Any, Dict, List, Optional, Tuple
+import time
 
 # ============================
 # Bootstrap / Config
@@ -25,18 +27,15 @@ logging.basicConfig(
 app = Flask(__name__)
 
 # In-memory store for timers (resets on restart)
-timers = {}
+timers: Dict[str, Dict[str, Any]] = {}
 
-# De-dupe Todoist deliveries (avoid reprocessing retries)
-PROCESSED_DELIVERIES = OrderedDict()  # delivery_id -> True
-MAX_DELIVERIES = 2000
-
-# De-dupe completions (avoid double-beemind / double-complete-comment)
+# De-dupe stores
+PROCESSED_DELIVERIES = OrderedDict()   # delivery_id -> True
 PROCESSED_COMPLETIONS = OrderedDict()  # f"{task_id}:{completed_at}" -> True
-MAX_COMPLETIONS = 5000
+PROCESSED_NOTES = OrderedDict()        # note_id -> True
 
-# De-dupe note triggers (avoid double-count from retries)
-PROCESSED_NOTES = OrderedDict()  # note_id -> True
+MAX_DELIVERIES = 2000
+MAX_COMPLETIONS = 5000
 MAX_NOTES = 5000
 
 # ---- Todoist ----
@@ -50,7 +49,10 @@ if not TODOIST_CLIENT_SECRET:
     app.logger.warning("TODOIST_CLIENT_SECRET not set – HMAC validation will fail.")
 
 # Label that triggers Beeminder logging when the task is completed
-TRIGGER_LABEL = (os.getenv("TODOIST_BEEMINDER_LABEL") or "beeminder").lower()
+# Can be a label NAME (e.g., "beeminder") or a numeric ID string.
+TRIGGER_LABEL_RAW = os.getenv("TODOIST_BEEMINDER_LABEL") or "beeminder"
+TRIGGER_LABEL_NAME = TRIGGER_LABEL_RAW.lower()
+TRIGGER_LABEL_ID = int(TRIGGER_LABEL_RAW) if TRIGGER_LABEL_RAW.isdigit() else None
 
 # ---- Beeminder ----
 BEEMINDER_API_BASE = "https://www.beeminder.com/api/v1"
@@ -61,47 +63,36 @@ BEEMINDER_GOAL_SLUG = os.getenv("BEEMINDER_GOAL_SLUG") or "dailyprayers"
 if not (BEEMINDER_USERNAME and BEEMINDER_AUTH_TOKEN):
     app.logger.warning("BEEMINDER_USERNAME or BEEMINDER_AUTH_TOKEN not set – Beeminder posting will fail.")
 
+# ---- Label cache (ID -> name), refreshed opportunistically ----
+_label_cache: Dict[int, str] = {}
+_label_cache_ts: float = 0.0
+LABEL_CACHE_TTL_SEC = 600  # 10 minutes
+
+
 # ============================
 # Helpers
 # ============================
-def _dedupe_delivery(delivery_id: str) -> bool:
-    """Return True if we've already processed this delivery_id; otherwise record it and return False."""
-    if not delivery_id:
-        return False
-    if delivery_id in PROCESSED_DELIVERIES:
-        return True
-    PROCESSED_DELIVERIES[delivery_id] = True
-    if len(PROCESSED_DELIVERIES) > MAX_DELIVERIES:
-        PROCESSED_DELIVERIES.popitem(last=False)
-    return False
-
-def _dedupe_completion(key: str) -> bool:
-    """Return True if we've already processed this completion key; otherwise record it and return False."""
+def _dedupe_push(store: OrderedDict, key: str, maxlen: int) -> bool:
     if not key:
         return False
-    if key in PROCESSED_COMPLETIONS:
+    if key in store:
         return True
-    PROCESSED_COMPLETIONS[key] = True
-    if len(PROCESSED_COMPLETIONS) > MAX_COMPLETIONS:
-        PROCESSED_COMPLETIONS.popitem(last=False)
+    store[key] = True
+    if len(store) > maxlen:
+        store.popitem(last=False)
     return False
+
+def _dedupe_delivery(delivery_id: str) -> bool:
+    return _dedupe_push(PROCESSED_DELIVERIES, delivery_id or "", MAX_DELIVERIES)
+
+def _dedupe_completion(key: str) -> bool:
+    return _dedupe_push(PROCESSED_COMPLETIONS, key or "", MAX_COMPLETIONS)
 
 def _dedupe_note(note_id: str) -> bool:
-    """Return True if we've already processed this note id; otherwise record it and return False."""
-    if not note_id:
-        return False
-    if note_id in PROCESSED_NOTES:
-        return True
-    PROCESSED_NOTES[note_id] = True
-    if len(PROCESSED_NOTES) > MAX_NOTES:
-        PROCESSED_NOTES.popitem(last=False)
-    return False
+    return _dedupe_push(PROCESSED_NOTES, str(note_id or ""), MAX_NOTES)
 
 def validate_hmac(payload: bytes, received_hmac: str) -> bool:
-    """
-    Validate Todoist webhook signature:
-    header 'X-Todoist-Hmac-SHA256' == base64(HMAC_SHA256(client_secret, raw_body))
-    """
+    """Validate Todoist webhook signature (base64(HMAC_SHA256(secret, raw_body)))."""
     try:
         mac = hmac.new(TODOIST_CLIENT_SECRET.encode(), payload, hashlib.sha256).digest()
         expected = base64.b64encode(mac).decode()
@@ -123,18 +114,13 @@ def post_todoist_comment(task_id: str, content: str) -> None:
     except Exception as e:
         app.logger.error(f"Error posting comment to Todoist: {e}")
 
-def comment_task_completed(task_id: str, task_title: str | None = None) -> None:
-    """
-    Helper: comment on ANY completed task. Keep message free of trigger words ("beeminder").
-    """
+def comment_task_completed(task_id: str, task_title: Optional[str] = None) -> None:
+    """Comment on ANY completed task, without the word 'beeminder' to avoid loops."""
     title = (task_title or "").strip()
-    if title:
-        post_todoist_comment(task_id, f"Task completed ✅ — {title}")
-    else:
-        post_todoist_comment(task_id, "Task completed ✅")
+    post_todoist_comment(task_id, f"Task completed ✅ — {title}" if title else "Task completed ✅")
 
 def update_todoist_description(task_id: str, new_description: str) -> bool:
-    """Update a Todoist task's description."""
+    """Update a Todoist task's description (works on active tasks)."""
     try:
         url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
         headers = {"Authorization": f"Bearer {TODOIST_API_TOKEN}", "Content-Type": "application/json"}
@@ -148,36 +134,33 @@ def update_todoist_description(task_id: str, new_description: str) -> bool:
         app.logger.error(f"Error updating Todoist description: {e}")
         return False
 
-def get_current_description(task_id: str):
-    """Fetch the current description of a Todoist task."""
+def get_current_description(task_id: str) -> Optional[str]:
+    """Fetch the current description of a Todoist task (active tasks only)."""
     try:
         url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
         headers = {"Authorization": f"Bearer {TODOIST_API_TOKEN}", "Content-Type": "application/json"}
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code != 200:
-            app.logger.error(f"Failed to fetch task ({resp.status_code}): {resp.text}")
+            app.logger.warning(f"Fetch task {task_id} failed ({resp.status_code})")
             return None
         return resp.json().get("description", "")
     except Exception as e:
         app.logger.error(f"Error fetching Todoist task: {e}")
         return None
 
-def get_task_content(task_id: str) -> str | None:
-    """Fetch the task title/content."""
+def get_task_content(task_id: str) -> Optional[str]:
+    """Fetch the task title/content (active tasks only; may 404 for completed)."""
     try:
         url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
         headers = {"Authorization": f"Bearer {TODOIST_API_TOKEN}", "Content-Type": "application/json"}
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code != 200:
-            app.logger.error(f"Failed to fetch task content ({resp.status_code}): {resp.text}")
             return None
         return (resp.json().get("content") or "").strip()
-    except Exception as e:
-        app.logger.error(f"Error fetching Todoist task content: {e}")
+    except Exception:
         return None
 
-def iso_to_unix(ts: str):
-    """Convert ISO8601 string to unix seconds (int)."""
+def iso_to_unix(ts: Optional[str]) -> Optional[int]:
     if not ts:
         return None
     try:
@@ -188,22 +171,59 @@ def iso_to_unix(ts: str):
         app.logger.warning(f"Could not parse timestamp '{ts}': {e}")
         return None
 
-def post_beeminder_datapoint(value: float, comment: str, timestamp: int, requestid: str) -> bool:
-    """Create a datapoint on Beeminder for the configured goal."""
+def _refresh_label_cache_if_needed():
+    global _label_cache, _label_cache_ts
+    now = time.time()
+    if now - _label_cache_ts < LABEL_CACHE_TTL_SEC:
+        return
+    try:
+        headers = {"Authorization": f"Bearer {TODOIST_API_TOKEN}"}
+        resp = requests.get(f"{TODOIST_API_BASE_URL}/labels", headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json() or []
+            _label_cache = {int(lbl["id"]): lbl.get("name", "").strip() for lbl in data if "id" in lbl}
+            _label_cache_ts = now
+            app.logger.info(f"Refreshed label cache with {len(_label_cache)} labels.")
+        else:
+            app.logger.warning(f"Label list failed ({resp.status_code}): {resp.text}")
+    except Exception as e:
+        app.logger.error(f"Label cache refresh error: {e}")
+
+def _coerce_labels_to_names(raw_labels: List[Any]) -> Tuple[List[str], List[int]]:
+    """
+    Accept both names and numeric IDs as seen in community examples.
+    Return (label_names_lower, label_ids).
+    """
+    if not raw_labels:
+        return [], []
+    names: List[str] = []
+    ids: List[int] = []
+    # Determine if labels are IDs (ints/str digits) or names
+    all_numbers = all(isinstance(x, int) or (isinstance(x, str) and x.isdigit()) for x in raw_labels)
+    if all_numbers:
+        ids = [int(x) for x in raw_labels]
+        _refresh_label_cache_if_needed()
+        for lid in ids:
+            n = _label_cache.get(lid)
+            if n:
+                names.append(n.lower())
+        return names, ids
+    # Otherwise treat as names
+    names = [str(x).strip().lower() for x in raw_labels]
+    return names, []
+
+def post_beeminder_datapoint(value: float, comment: str, timestamp: Optional[int], requestid: Optional[str]) -> bool:
+    """Create a datapoint on Beeminder for the configured goal (idempotent via requestid)."""
     if not (BEEMINDER_USERNAME and BEEMINDER_AUTH_TOKEN):
         app.logger.error("Beeminder credentials missing.")
         return False
     try:
         url = f"{BEEMINDER_API_BASE}/users/{BEEMINDER_USERNAME}/goals/{BEEMINDER_GOAL_SLUG}/datapoints.json"
-        data = {
-            "auth_token": BEEMINDER_AUTH_TOKEN,
-            "value": value,
-            "comment": comment,
-        }
+        data = {"auth_token": BEEMINDER_AUTH_TOKEN, "value": value, "comment": comment}
         if timestamp is not None:
             data["timestamp"] = timestamp
         if requestid:
-            data["requestid"] = requestid  # idempotency
+            data["requestid"] = requestid
         resp = requests.post(url, data=data, timeout=15)
         if resp.status_code in (200, 201):
             app.logger.info(f"Beeminder datapoint OK: {resp.text}")
@@ -214,6 +234,59 @@ def post_beeminder_datapoint(value: float, comment: str, timestamp: int, request
         app.logger.error(f"Error posting to Beeminder: {e}")
         return False
 
+# ---------- Completion normalization (mirrors how other repos read event_data) ----------
+def _as_bool(v: Any) -> bool:
+    return bool(v) and str(v).lower() not in ("false", "0", "none", "null")
+
+def _normalize_completion(event_name: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Normalize various community-seen completion signals to one shape:
+    { task_id, content, labels (names lower), label_ids, completed_at_iso }
+    Supports:
+      - item:completed  (common)
+      - task:completed  (seen in some REST-created webhooks)
+      - item:updated + checked true or update_intent=='item_completed'
+    """
+    ev = data.get("event_data") or {}
+    # case: item:completed (typical)
+    if event_name == "item:completed":
+        task = ev
+        task_id = str(task.get("id") or "")
+        content = (task.get("content") or "").strip()
+        labels_raw = task.get("labels") or []
+        names, ids = _coerce_labels_to_names(labels_raw)
+        completed_at = task.get("completed_at") or data.get("triggered_at")
+        return {"task_id": task_id, "content": content, "label_names": names, "label_ids": ids, "completed_at": completed_at}
+
+    # case: task:completed (seen in some community repos)
+    if event_name == "task:completed":
+        # some payloads mirror item:completed; others may send a subset
+        task = ev
+        # Try common keys first, then fallbacks
+        task_id = str(task.get("id") or task.get("task_id") or "")
+        content = (task.get("content") or "").strip()
+        labels_raw = task.get("labels") or []
+        names, ids = _coerce_labels_to_names(labels_raw)
+        completed_at = task.get("completed_at") or data.get("triggered_at")
+        return {"task_id": task_id, "content": content, "label_names": names, "label_ids": ids, "completed_at": completed_at}
+
+    # case: item:updated → completion
+    if event_name == "item:updated":
+        task = ev
+        # If Todoist includes 'update_intent', use that; otherwise judge by checked/completed_at.
+        intent = (task.get("update_intent") or "").lower()
+        checked = _as_bool(task.get("checked"))
+        completed_at = task.get("completed_at") or data.get("triggered_at")
+        if intent == "item_completed" or (checked and completed_at):
+            task_id = str(task.get("id") or "")
+            content = (task.get("content") or "").strip()
+            labels_raw = task.get("labels") or []
+            names, ids = _coerce_labels_to_names(labels_raw)
+            return {"task_id": task_id, "content": content, "label_names": names, "label_ids": ids, "completed_at": completed_at}
+
+    return None
+
+
 # ============================
 # Webhook endpoint
 # ============================
@@ -223,7 +296,7 @@ def webhook():
         received_hmac = request.headers.get("X-Todoist-Hmac-SHA256", "")
         delivery_id = request.headers.get("X-Todoist-Delivery-ID")  # unique per event
 
-        # Validate HMAC
+        # Validate HMAC (community examples sometimes skip, but we keep it)
         if not received_hmac or not validate_hmac(request.data, received_hmac):
             app.logger.error("Invalid or missing HMAC.")
             return "", 401
@@ -233,37 +306,39 @@ def webhook():
             app.logger.info(f"Duplicate delivery {delivery_id}; skipping.")
             return "", 200
 
-        data = request.get_json(silent=True) or {}
-        event_name = data.get("event_name")
-        event_data = data.get("event_data") or {}
+        body = request.get_json(silent=True) or {}
+        event_name = (body.get("event_name") or "").strip()
+        event_data = body.get("event_data") or {}
         app.logger.info(f"Event: {event_name}")
 
-        # ===== Todoist -> Beeminder + Completed comment =====
-        if event_name == "item:completed":
-            task = event_data
-            task_id = task.get("id")
-            task_content = (task.get("content") or "").strip()
-            # In Sync/Unified API, labels are names (strings)
-            labels = [str(l).lower() for l in (task.get("labels") or [])]
-            completed_at = task.get("completed_at") or data.get("triggered_at")
+        # ======= Completion handling like other users do =======
+        normalized = _normalize_completion(event_name, body)
+        if normalized:
+            task_id = normalized["task_id"]
+            task_title = normalized["content"]
+            label_names = normalized["label_names"]
+            label_ids = normalized["label_ids"]
+            completed_at = normalized["completed_at"]
             ts = iso_to_unix(completed_at)
 
+            # completion de-dupe
             completion_key = f"{task_id}:{completed_at or ''}"
             if _dedupe_completion(completion_key):
                 app.logger.info(f"Duplicate completion {completion_key}; skipping.")
                 return "", 200
 
-            # Always drop a simple completion comment (no trigger words)
+            # Always comment "Task completed"
             if task_id:
-                comment_task_completed(task_id, task_content)
+                comment_task_completed(task_id, task_title)
 
-            # If labeled, also count toward Beeminder
-            if TRIGGER_LABEL in labels:
-                bm_comment = f"Todoist: {task_content}"
-                reqid = f"complete:{completion_key}"  # stable idempotency
+            # If labeled for Beeminder, count +1
+            label_match = (TRIGGER_LABEL_NAME in label_names) or (TRIGGER_LABEL_ID is not None and TRIGGER_LABEL_ID in label_ids)
+            if label_match:
+                bm_comment = f"Todoist: {task_title}"
+                reqid = f"complete:{completion_key}"
                 ok = post_beeminder_datapoint(value=1, comment=bm_comment, timestamp=ts, requestid=reqid)
-                # Confirmation avoids trigger phrase
                 post_todoist_comment(task_id, "Counted ✅" if ok else "Failed to count ❌")
+
             return "", 200
 
         # ===== Comment triggers (note:added) =====
@@ -273,42 +348,38 @@ def webhook():
             note_id = event_data.get("id")
             comment_text = (event_data.get("content") or "")
             lowered = comment_text.lower()
-            note_time = event_data.get("posted_at") or event_data.get("posted") or data.get("triggered_at")
+            note_time = event_data.get("posted_at") or event_data.get("posted") or body.get("triggered_at")
             ts = iso_to_unix(note_time)
 
             if not task_id or not user_id:
                 app.logger.error("Invalid payload: Missing task_id or user_id.")
                 return "", 400
 
-            # De-dupe notes by note_id
             if _dedupe_note(str(note_id) if note_id is not None else ""):
                 app.logger.info(f"Duplicate note {note_id}; skipping.")
                 return "", 200
 
-            # --- Strict trigger: comment must be exactly "beeminder" or "bm" ---
+            # Strict trigger: exactly "beeminder" or "bm" to add +1
             if lowered.strip() in ("beeminder", "bm"):
                 title = get_task_content(task_id) or "(untitled task)"
                 bm_comment = f"Todoist (comment): {title}"
-                # Use stable requestid for comments too
                 reqid = f"note:{note_id}" if note_id else f"note:{task_id}:{ts or ''}"
                 ok = post_beeminder_datapoint(value=1, comment=bm_comment, timestamp=ts, requestid=reqid)
                 post_todoist_comment(task_id, "Counted ✅" if ok else "Failed to count ❌")
                 return "", 200
 
-            # --- Existing timer controls ---
+            # Timer controls
             timer_key = f"{user_id}:{task_id}"
             if "start timer" in lowered:
-                if timer_key in timers:
-                    return "", 200
-                timers[timer_key] = {"start_time": datetime.datetime.now()}
-
-                current_desc = get_current_description(task_id)
-                if current_desc is not None:
-                    pattern = r"\(Timer Running: \d+ minutes\)"
-                    updated_desc = re.sub(pattern, "", current_desc).strip()
-                    snippet = "(Timer Running: 0 minutes)"
-                    updated_desc = f"{updated_desc} {snippet}".strip() if updated_desc else snippet
-                    update_todoist_description(task_id, updated_desc)
+                if timer_key not in timers:
+                    timers[timer_key] = {"start_time": datetime.datetime.now()}
+                    current_desc = get_current_description(task_id)
+                    if current_desc is not None:
+                        pattern = r"\(Timer Running: \d+ minutes\)"
+                        updated = re.sub(pattern, "", current_desc).strip()
+                        snippet = "(Timer Running: 0 minutes)"
+                        updated = f"{updated} {snippet}".strip() if updated else snippet
+                        update_todoist_description(task_id, updated)
                 return "", 200
 
             if "stop timer" in lowered:
@@ -325,7 +396,6 @@ def webhook():
                 minutes, seconds = divmod(rem, 60)
                 elapsed_str = f"{hours}h {minutes}m {seconds}s"
 
-                # Optional comment; remove if you don't want it
                 post_todoist_comment(task_id, f"Elapsed time: {elapsed_str}")
 
                 current_desc = get_current_description(task_id)
@@ -361,6 +431,7 @@ def webhook():
         app.logger.error(f"Webhook error: {e}")
         return "", 500
 
+
 # ============================
 # Background job: update running timer snippets every minute
 # ============================
@@ -392,6 +463,7 @@ def start_scheduler():
     scheduler = BackgroundScheduler(daemon=True)
     scheduler.add_job(func=update_descriptions, trigger="interval", minutes=1)
     scheduler.start()
+
 
 # ============================
 # Entrypoint
