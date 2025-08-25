@@ -31,6 +31,14 @@ timers = {}
 PROCESSED_DELIVERIES = OrderedDict()  # delivery_id -> True
 MAX_DELIVERIES = 2000
 
+# De-dupe completions (avoid double-beemind / double-complete-comment)
+PROCESSED_COMPLETIONS = OrderedDict()  # f"{task_id}:{completed_at}" -> True
+MAX_COMPLETIONS = 5000
+
+# De-dupe note triggers (avoid double-count from retries)
+PROCESSED_NOTES = OrderedDict()  # note_id -> True
+MAX_NOTES = 5000
+
 # ---- Todoist ----
 TODOIST_API_BASE_URL = "https://api.todoist.com/rest/v2"
 TODOIST_API_TOKEN = os.getenv("TODOIST_API_TOKEN")
@@ -57,18 +65,36 @@ if not (BEEMINDER_USERNAME and BEEMINDER_AUTH_TOKEN):
 # Helpers
 # ============================
 def _dedupe_delivery(delivery_id: str) -> bool:
-    """
-    Return True if we've already processed this delivery_id.
-    Otherwise record it and return False.
-    """
+    """Return True if we've already processed this delivery_id; otherwise record it and return False."""
     if not delivery_id:
         return False
     if delivery_id in PROCESSED_DELIVERIES:
         return True
     PROCESSED_DELIVERIES[delivery_id] = True
-    # keep LRU-ish size bound
     if len(PROCESSED_DELIVERIES) > MAX_DELIVERIES:
         PROCESSED_DELIVERIES.popitem(last=False)
+    return False
+
+def _dedupe_completion(key: str) -> bool:
+    """Return True if we've already processed this completion key; otherwise record it and return False."""
+    if not key:
+        return False
+    if key in PROCESSED_COMPLETIONS:
+        return True
+    PROCESSED_COMPLETIONS[key] = True
+    if len(PROCESSED_COMPLETIONS) > MAX_COMPLETIONS:
+        PROCESSED_COMPLETIONS.popitem(last=False)
+    return False
+
+def _dedupe_note(note_id: str) -> bool:
+    """Return True if we've already processed this note id; otherwise record it and return False."""
+    if not note_id:
+        return False
+    if note_id in PROCESSED_NOTES:
+        return True
+    PROCESSED_NOTES[note_id] = True
+    if len(PROCESSED_NOTES) > MAX_NOTES:
+        PROCESSED_NOTES.popitem(last=False)
     return False
 
 def validate_hmac(payload: bytes, received_hmac: str) -> bool:
@@ -96,6 +122,16 @@ def post_todoist_comment(task_id: str, content: str) -> None:
             app.logger.error(f"Failed to post comment ({resp.status_code}): {resp.text}")
     except Exception as e:
         app.logger.error(f"Error posting comment to Todoist: {e}")
+
+def comment_task_completed(task_id: str, task_title: str | None = None) -> None:
+    """
+    Helper: comment on ANY completed task. Keep message free of trigger words ("beeminder").
+    """
+    title = (task_title or "").strip()
+    if title:
+        post_todoist_comment(task_id, f"Task completed ✅ — {title}")
+    else:
+        post_todoist_comment(task_id, "Task completed ✅")
 
 def update_todoist_description(task_id: str, new_description: str) -> bool:
     """Update a Todoist task's description."""
@@ -167,7 +203,7 @@ def post_beeminder_datapoint(value: float, comment: str, timestamp: int, request
         if timestamp is not None:
             data["timestamp"] = timestamp
         if requestid:
-            data["requestid"] = requestid  # idempotency (avoid duplicates on retries)
+            data["requestid"] = requestid  # idempotency
         resp = requests.post(url, data=data, timeout=15)
         if resp.status_code in (200, 201):
             app.logger.info(f"Beeminder datapoint OK: {resp.text}")
@@ -192,7 +228,7 @@ def webhook():
             app.logger.error("Invalid or missing HMAC.")
             return "", 401
 
-        # De-dupe retries
+        # De-dupe retries by delivery id
         if _dedupe_delivery(delivery_id):
             app.logger.info(f"Duplicate delivery {delivery_id}; skipping.")
             return "", 200
@@ -202,29 +238,33 @@ def webhook():
         event_data = data.get("event_data") or {}
         app.logger.info(f"Event: {event_name}")
 
-        # ===== Todoist -> Beeminder on task completion (label-triggered) =====
+        # ===== Todoist -> Beeminder + Completed comment =====
         if event_name == "item:completed":
             task = event_data
             task_id = task.get("id")
             task_content = (task.get("content") or "").strip()
-            # In Sync v9, labels are names (strings)
+            # In Sync/Unified API, labels are names (strings)
             labels = [str(l).lower() for l in (task.get("labels") or [])]
             completed_at = task.get("completed_at") or data.get("triggered_at")
             ts = iso_to_unix(completed_at)
 
-            app.logger.info(f"Completed task '{task_content}' ({task_id}); labels={labels}")
+            completion_key = f"{task_id}:{completed_at or ''}"
+            if _dedupe_completion(completion_key):
+                app.logger.info(f"Duplicate completion {completion_key}; skipping.")
+                return "", 200
 
+            # Always drop a simple completion comment (no trigger words)
+            if task_id:
+                comment_task_completed(task_id, task_content)
+
+            # If labeled, also count toward Beeminder
             if TRIGGER_LABEL in labels:
                 bm_comment = f"Todoist: {task_content}"
-                reqid = delivery_id or f"{task_id}:{completed_at or ''}"
+                reqid = f"complete:{completion_key}"  # stable idempotency
                 ok = post_beeminder_datapoint(value=1, comment=bm_comment, timestamp=ts, requestid=reqid)
-                if task_id:
-                    # Avoid trigger phrase in confirmation
-                    post_todoist_comment(task_id, "Counted ✅" if ok else "Failed to count ❌")
-                return "", 200
-            else:
-                app.logger.info("Completed task lacks trigger label; ignoring.")
-                return "", 200
+                # Confirmation avoids trigger phrase
+                post_todoist_comment(task_id, "Counted ✅" if ok else "Failed to count ❌")
+            return "", 200
 
         # ===== Comment triggers (note:added) =====
         if event_name == "note:added":
@@ -240,14 +280,18 @@ def webhook():
                 app.logger.error("Invalid payload: Missing task_id or user_id.")
                 return "", 400
 
+            # De-dupe notes by note_id
+            if _dedupe_note(str(note_id) if note_id is not None else ""):
+                app.logger.info(f"Duplicate note {note_id}; skipping.")
+                return "", 200
+
             # --- Strict trigger: comment must be exactly "beeminder" or "bm" ---
             if lowered.strip() in ("beeminder", "bm"):
-                # Try to include the task title in the datapoint comment
                 title = get_task_content(task_id) or "(untitled task)"
                 bm_comment = f"Todoist (comment): {title}"
-                reqid = delivery_id or (f"note:{note_id}" if note_id else None)
+                # Use stable requestid for comments too
+                reqid = f"note:{note_id}" if note_id else f"note:{task_id}:{ts or ''}"
                 ok = post_beeminder_datapoint(value=1, comment=bm_comment, timestamp=ts, requestid=reqid)
-                # Confirmation avoids the trigger phrase so it won't re-fire
                 post_todoist_comment(task_id, "Counted ✅" if ok else "Failed to count ❌")
                 return "", 200
 
