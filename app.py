@@ -10,6 +10,7 @@ import base64
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 import re
+from collections import OrderedDict
 
 # ============================
 # Bootstrap / Config
@@ -25,6 +26,10 @@ app = Flask(__name__)
 
 # In-memory store for timers (resets on restart)
 timers = {}
+
+# De-dupe Todoist deliveries (avoid reprocessing retries)
+PROCESSED_DELIVERIES = OrderedDict()  # delivery_id -> True
+MAX_DELIVERIES = 2000
 
 # ---- Todoist ----
 TODOIST_API_BASE_URL = "https://api.todoist.com/rest/v2"
@@ -51,6 +56,21 @@ if not (BEEMINDER_USERNAME and BEEMINDER_AUTH_TOKEN):
 # ============================
 # Helpers
 # ============================
+def _dedupe_delivery(delivery_id: str) -> bool:
+    """
+    Return True if we've already processed this delivery_id.
+    Otherwise record it and return False.
+    """
+    if not delivery_id:
+        return False
+    if delivery_id in PROCESSED_DELIVERIES:
+        return True
+    PROCESSED_DELIVERIES[delivery_id] = True
+    # keep LRU-ish size bound
+    if len(PROCESSED_DELIVERIES) > MAX_DELIVERIES:
+        PROCESSED_DELIVERIES.popitem(last=False)
+    return False
+
 def validate_hmac(payload: bytes, received_hmac: str) -> bool:
     """
     Validate Todoist webhook signature:
@@ -172,6 +192,11 @@ def webhook():
             app.logger.error("Invalid or missing HMAC.")
             return "", 401
 
+        # De-dupe retries
+        if _dedupe_delivery(delivery_id):
+            app.logger.info(f"Duplicate delivery {delivery_id}; skipping.")
+            return "", 200
+
         data = request.get_json(silent=True) or {}
         event_name = data.get("event_name")
         event_data = data.get("event_data") or {}
@@ -194,7 +219,8 @@ def webhook():
                 reqid = delivery_id or f"{task_id}:{completed_at or ''}"
                 ok = post_beeminder_datapoint(value=1, comment=bm_comment, timestamp=ts, requestid=reqid)
                 if task_id:
-                    post_todoist_comment(task_id, "Logged to Beeminder ✅" if ok else "Beeminder logging failed ❌")
+                    # Avoid trigger phrase in confirmation
+                    post_todoist_comment(task_id, "Counted ✅" if ok else "Failed to count ❌")
                 return "", 200
             else:
                 app.logger.info("Completed task lacks trigger label; ignoring.")
@@ -205,7 +231,8 @@ def webhook():
             task_id = event_data.get("item", {}).get("id")
             user_id = event_data.get("item", {}).get("user_id")
             note_id = event_data.get("id")
-            comment_text = (event_data.get("content") or "").lower()
+            comment_text = (event_data.get("content") or "")
+            lowered = comment_text.lower()
             note_time = event_data.get("posted_at") or event_data.get("posted") or data.get("triggered_at")
             ts = iso_to_unix(note_time)
 
@@ -213,19 +240,20 @@ def webhook():
                 app.logger.error("Invalid payload: Missing task_id or user_id.")
                 return "", 400
 
-            # --- NEW: "beeminder" comment => +1 to dailyprayers ---
-            if re.search(r"\bbeeminder\b", comment_text):
+            # --- Strict trigger: comment must be exactly "beeminder" or "bm" ---
+            if lowered.strip() in ("beeminder", "bm"):
                 # Try to include the task title in the datapoint comment
                 title = get_task_content(task_id) or "(untitled task)"
                 bm_comment = f"Todoist (comment): {title}"
                 reqid = delivery_id or (f"note:{note_id}" if note_id else None)
                 ok = post_beeminder_datapoint(value=1, comment=bm_comment, timestamp=ts, requestid=reqid)
-                post_todoist_comment(task_id, "Logged to Beeminder via comment ✅" if ok else "Beeminder logging failed ❌")
+                # Confirmation avoids the trigger phrase so it won't re-fire
+                post_todoist_comment(task_id, "Counted ✅" if ok else "Failed to count ❌")
                 return "", 200
 
             # --- Existing timer controls ---
             timer_key = f"{user_id}:{task_id}"
-            if "start timer" in comment_text:
+            if "start timer" in lowered:
                 if timer_key in timers:
                     return "", 200
                 timers[timer_key] = {"start_time": datetime.datetime.now()}
@@ -239,7 +267,7 @@ def webhook():
                     update_todoist_description(task_id, updated_desc)
                 return "", 200
 
-            if "stop timer" in comment_text:
+            if "stop timer" in lowered:
                 if timer_key not in timers:
                     post_todoist_comment(task_id, "No timer found to stop.")
                     return "", 200
