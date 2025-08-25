@@ -198,7 +198,6 @@ def _coerce_labels_to_names(raw_labels: List[Any]) -> Tuple[List[str], List[int]
         return [], []
     names: List[str] = []
     ids: List[int] = []
-    # Determine if labels are IDs (ints/str digits) or names
     all_numbers = all(isinstance(x, int) or (isinstance(x, str) and x.isdigit()) for x in raw_labels)
     if all_numbers:
         ids = [int(x) for x in raw_labels]
@@ -208,7 +207,6 @@ def _coerce_labels_to_names(raw_labels: List[Any]) -> Tuple[List[str], List[int]
             if n:
                 names.append(n.lower())
         return names, ids
-    # Otherwise treat as names
     names = [str(x).strip().lower() for x in raw_labels]
     return names, []
 
@@ -234,54 +232,51 @@ def post_beeminder_datapoint(value: float, comment: str, timestamp: Optional[int
         app.logger.error(f"Error posting to Beeminder: {e}")
         return False
 
-# ---------- Completion normalization (mirrors how other repos read event_data) ----------
+# ---------- Completion normalization (community patterns) ----------
 def _as_bool(v: Any) -> bool:
     return bool(v) and str(v).lower() not in ("false", "0", "none", "null")
 
-def _normalize_completion(event_name: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _normalize_completion(event_name: str, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Normalize various community-seen completion signals to one shape:
-    { task_id, content, labels (names lower), label_ids, completed_at_iso }
+    Normalize the common real-world completion signals to one shape:
+    { task_id, content, label_names (lower), label_ids, completed_at }
     Supports:
       - item:completed  (common)
-      - task:completed  (seen in some REST-created webhooks)
-      - item:updated + checked true or update_intent=='item_completed'
+      - task:completed  (seen in REST-created webhooks)
+      - item:updated + any of:
+          checked == true OR is_completed == true OR completed == true
+          OR update_intent == 'item_completed'
     """
-    ev = data.get("event_data") or {}
-    # case: item:completed (typical)
+    ev = body.get("event_data") or {}
+
+    # 1) item:completed
     if event_name == "item:completed":
-        task = ev
-        task_id = str(task.get("id") or "")
-        content = (task.get("content") or "").strip()
-        labels_raw = task.get("labels") or []
-        names, ids = _coerce_labels_to_names(labels_raw)
-        completed_at = task.get("completed_at") or data.get("triggered_at")
+        task_id = str(ev.get("id") or "")
+        content = (ev.get("content") or "").strip()
+        names, ids = _coerce_labels_to_names(ev.get("labels") or [])
+        completed_at = ev.get("completed_at") or body.get("triggered_at")
         return {"task_id": task_id, "content": content, "label_names": names, "label_ids": ids, "completed_at": completed_at}
 
-    # case: task:completed (seen in some community repos)
+    # 2) task:completed
     if event_name == "task:completed":
-        # some payloads mirror item:completed; others may send a subset
-        task = ev
-        # Try common keys first, then fallbacks
-        task_id = str(task.get("id") or task.get("task_id") or "")
-        content = (task.get("content") or "").strip()
-        labels_raw = task.get("labels") or []
-        names, ids = _coerce_labels_to_names(labels_raw)
-        completed_at = task.get("completed_at") or data.get("triggered_at")
+        task_id = str(ev.get("id") or ev.get("task_id") or "")
+        content = (ev.get("content") or "").strip()
+        names, ids = _coerce_labels_to_names(ev.get("labels") or [])
+        completed_at = ev.get("completed_at") or body.get("triggered_at")
         return {"task_id": task_id, "content": content, "label_names": names, "label_ids": ids, "completed_at": completed_at}
 
-    # case: item:updated → completion
+    # 3) item:updated => completion
     if event_name == "item:updated":
-        task = ev
-        # If Todoist includes 'update_intent', use that; otherwise judge by checked/completed_at.
-        intent = (task.get("update_intent") or "").lower()
-        checked = _as_bool(task.get("checked"))
-        completed_at = task.get("completed_at") or data.get("triggered_at")
-        if intent == "item_completed" or (checked and completed_at):
-            task_id = str(task.get("id") or "")
-            content = (task.get("content") or "").strip()
-            labels_raw = task.get("labels") or []
-            names, ids = _coerce_labels_to_names(labels_raw)
+        intent = (ev.get("update_intent") or "").lower()
+        checked = _as_bool(ev.get("checked"))
+        is_completed = _as_bool(ev.get("is_completed"))
+        completed_flag = _as_bool(ev.get("completed"))
+        completed_at = ev.get("completed_at") or ev.get("date_completed") or body.get("triggered_at")
+
+        if intent == "item_completed" or checked or is_completed or (completed_flag and completed_at):
+            task_id = str(ev.get("id") or "")
+            content = (ev.get("content") or "").strip()
+            names, ids = _coerce_labels_to_names(ev.get("labels") or [])
             return {"task_id": task_id, "content": content, "label_names": names, "label_ids": ids, "completed_at": completed_at}
 
     return None
@@ -296,7 +291,7 @@ def webhook():
         received_hmac = request.headers.get("X-Todoist-Hmac-SHA256", "")
         delivery_id = request.headers.get("X-Todoist-Delivery-ID")  # unique per event
 
-        # Validate HMAC (community examples sometimes skip, but we keep it)
+        # Validate HMAC
         if not received_hmac or not validate_hmac(request.data, received_hmac):
             app.logger.error("Invalid or missing HMAC.")
             return "", 401
@@ -311,7 +306,7 @@ def webhook():
         event_data = body.get("event_data") or {}
         app.logger.info(f"Event: {event_name}")
 
-        # ======= Completion handling like other users do =======
+        # ======= Completion handling (matches community patterns) =======
         normalized = _normalize_completion(event_name, body)
         if normalized:
             task_id = normalized["task_id"]
@@ -424,7 +419,7 @@ def webhook():
             return "", 200
 
         # Unhandled events
-        app.logger.info(f"Unhandled event: {event_name}")
+        app.logger.info(f"Unhandled event: {event_name} (keys: {list(event_data.keys())})")
         return "", 200
 
     except Exception as e:
