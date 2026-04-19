@@ -163,13 +163,6 @@ def get_task(task_id: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-def get_task_content(task_id: str) -> Optional[str]:
-    """Fetch the task title/content (active tasks only)."""
-    t = get_task(task_id)
-    if not t:
-        return None
-    return (t.get("content") or "").strip()
-
 def iso_to_unix(ts: Optional[str]) -> Optional[int]:
     if not ts:
         return None
@@ -506,7 +499,7 @@ def webhook():
         return "", 200
 
     except Exception as e:
-        app.logger.error(f"Webhook error: {e}")
+        app.logger.exception(f"Webhook error: {e}")
         return "", 500
 
 
