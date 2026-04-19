@@ -39,7 +39,7 @@ MAX_COMPLETIONS = 5000
 MAX_NOTES = 5000
 
 # ---- Todoist ----
-TODOIST_API_BASE_URL = "https://api.todoist.com/rest/v2"
+TODOIST_API_BASE_URL = "https://api.todoist.com/api/v1"
 TODOIST_API_TOKEN = os.getenv("TODOIST_API_TOKEN")
 TODOIST_CLIENT_SECRET = os.getenv("TODOIST_CLIENT_SECRET")
 
@@ -51,7 +51,7 @@ if not TODOIST_CLIENT_SECRET:
 # Trigger label that says "log this completion to Beeminder"
 TRIGGER_LABEL_RAW = os.getenv("TODOIST_BEEMINDER_LABEL") or "beeminder"
 TRIGGER_LABEL_NAME = TRIGGER_LABEL_RAW.lower()
-TRIGGER_LABEL_ID = int(TRIGGER_LABEL_RAW) if TRIGGER_LABEL_RAW.isdigit() else None
+TRIGGER_LABEL_ID = TRIGGER_LABEL_RAW if TRIGGER_LABEL_RAW.isdigit() else None
 
 # ---- Beeminder ----
 BEEMINDER_API_BASE = "https://www.beeminder.com/api/v1"
@@ -66,7 +66,7 @@ if not (BEEMINDER_USERNAME and BEEMINDER_AUTH_TOKEN):
     app.logger.warning("BEEMINDER_USERNAME or BEEMINDER_AUTH_TOKEN not set – Beeminder posting will fail.")
 
 # ---- Label cache (ID -> name), refreshed opportunistically ----
-_label_cache: Dict[int, str] = {}
+_label_cache: Dict[str, str] = {}
 _label_cache_ts: float = 0.0
 LABEL_CACHE_TTL_SEC = 600  # 10 minutes
 
@@ -136,19 +136,20 @@ def update_todoist_description(task_id: str, new_description: str) -> bool:
         app.logger.error(f"Error updating Todoist description: {e}")
         return False
 
-def get_current_description(task_id: str) -> Optional[str]:
-    """Fetch the current description of a Todoist task (active tasks only)."""
+def get_current_description(task_id: str) -> Tuple[Optional[str], Optional[int]]:
+    """Fetch the current description of a Todoist task (active tasks only).
+    Returns (description, status_code). On network error returns (None, None)."""
     try:
         url = f"{TODOIST_API_BASE_URL}/tasks/{task_id}"
         headers = {"Authorization": f"Bearer {TODOIST_API_TOKEN}", "Content-Type": "application/json"}
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code != 200:
             app.logger.warning(f"Fetch task {task_id} failed ({resp.status_code})")
-            return None
-        return resp.json().get("description", "")
+            return None, resp.status_code
+        return resp.json().get("description", ""), 200
     except Exception as e:
         app.logger.error(f"Error fetching Todoist task: {e}")
-        return None
+        return None, None
 
 def get_task(task_id: str) -> Optional[Dict[str, Any]]:
     """Fetch the full task (active tasks only; completed tasks may 404)."""
@@ -190,7 +191,7 @@ def _refresh_label_cache_if_needed():
         resp = requests.get(f"{TODOIST_API_BASE_URL}/labels", headers=headers, timeout=15)
         if resp.status_code == 200:
             data = resp.json() or []
-            _label_cache = {int(lbl["id"]): lbl.get("name", "").strip() for lbl in data if "id" in lbl}
+            _label_cache = {str(lbl["id"]): lbl.get("name", "").strip() for lbl in data if "id" in lbl}
             _label_cache_ts = now
             app.logger.info(f"Refreshed label cache with {len(_label_cache)} labels.")
         else:
@@ -198,7 +199,7 @@ def _refresh_label_cache_if_needed():
     except Exception as e:
         app.logger.error(f"Label cache refresh error: {e}")
 
-def _coerce_labels_to_names(raw_labels: List[Any]) -> Tuple[List[str], List[int]]:
+def _coerce_labels_to_names(raw_labels: List[Any]) -> Tuple[List[str], List[str]]:
     """
     Accept both names and numeric IDs as seen in community examples.
     Return (label_names_lower, label_ids).
@@ -206,10 +207,10 @@ def _coerce_labels_to_names(raw_labels: List[Any]) -> Tuple[List[str], List[int]
     if not raw_labels:
         return [], []
     names: List[str] = []
-    ids: List[int] = []
+    ids: List[str] = []
     all_numbers = all(isinstance(x, int) or (isinstance(x, str) and x.isdigit()) for x in raw_labels)
     if all_numbers:
-        ids = [int(x) for x in raw_labels]
+        ids = [str(x) for x in raw_labels]
         _refresh_label_cache_if_needed()
         for lid in ids:
             n = _label_cache.get(lid)
@@ -329,6 +330,14 @@ def _normalize_completion(event_name: str, body: Dict[str, Any]) -> Optional[Dic
 # ============================
 # Webhook endpoint
 # ============================
+# Todoist webhook event types (20 total):
+# item:added, item:updated, item:deleted, item:completed, item:uncompleted,
+# note:added, note:updated, note:deleted,
+# project:added, project:updated, project:deleted, project:archived, project:unarchived,
+# section:added, section:updated, section:deleted, section:archived, section:unarchived,
+# label:added, label:updated, label:deleted,
+# filter:added, filter:updated, filter:deleted,
+# reminder:fired
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
@@ -433,7 +442,7 @@ def webhook():
             if "start timer" in lowered:
                 if timer_key not in timers:
                     timers[timer_key] = {"start_time": datetime.datetime.now()}
-                    current_desc = get_current_description(task_id)
+                    current_desc, _ = get_current_description(task_id)
                     if current_desc is not None:
                         pattern = r"\(Timer Running: \d+ minutes\)"
                         updated = re.sub(pattern, "", current_desc).strip()
@@ -458,7 +467,7 @@ def webhook():
 
                 post_todoist_comment(task_id, f"Elapsed time: {elapsed_str}")
 
-                current_desc = get_current_description(task_id)
+                current_desc, _ = get_current_description(task_id)
                 if current_desc is not None:
                     total_time_pattern = r"\(Total Time: (\d+)h (\d+)m (\d+)s\)"
                     match = re.search(total_time_pattern, current_desc)
@@ -483,8 +492,17 @@ def webhook():
 
             return "", 200
 
-        # Unhandled events
-        app.logger.info(f"Unhandled event: {event_name}")
+        # ===== item:added / item:updated (non-completion) =====
+        if event_name == "item:added":
+            app.logger.debug(f"item:added event received: {body}")
+            return "", 200
+
+        if event_name == "item:updated":
+            app.logger.debug(f"item:updated event received (non-completion): {body}")
+            return "", 200
+
+        # Generic fallback for unhandled events
+        app.logger.info(f"Unhandled event: {event_name}, payload keys: {list(body.keys())}")
         return "", 200
 
     except Exception as e:
@@ -509,8 +527,11 @@ def update_descriptions():
             continue
 
         elapsed_minutes = int((now - start_time).total_seconds() // 60)
-        current_description = get_current_description(task_id)
+        current_description, status_code = get_current_description(task_id)
         if current_description is None:
+            if status_code in (404, 410):
+                app.logger.info(f"Task {task_id} returned {status_code}; removing from timer tracking.")
+                del timers[timer_key]
             continue
 
         pattern = r"\(Timer Running: \d+ minutes\)"
